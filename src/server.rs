@@ -167,19 +167,24 @@ impl Connection {
             return Err(SocksError::NoAuthMethods);
         }
 
-        // Limit the number of methods to prevent DoS
-        let nmethods = nmethods.min(MAX_AUTH_METHODS);
+        // Read ALL methods that the client sent into a buffer
+        // This is critical: we must consume all bytes from the stream to prevent
+        // leftover data from corrupting subsequent reads (e.g., the SOCKS request)
+        let mut methods = vec![0u8; nmethods];
+        reader.read_exact(&mut methods).await?;
 
-        // Read methods
-        let mut methods = Vec::with_capacity(nmethods);
-        for _ in 0..nmethods {
-            let method = reader.read_u8().await?;
-            methods.push(AuthMethod(method));
-        }
+        // Build the methods vector from only the methods we're willing to process
+        // We limit to MAX_AUTH_METHODS to prevent DoS, but we've already consumed
+        // all bytes from the stream above
+        let processed_methods: Vec<AuthMethod> = methods
+            .into_iter()
+            .take(MAX_AUTH_METHODS)
+            .map(AuthMethod)
+            .collect();
 
         Ok(ClientHello {
             version,
-            methods,
+            methods: processed_methods,
         })
     }
 
@@ -344,16 +349,34 @@ impl Connection {
     }
 }
 
-/// Run the SOCKS5 server
+/// Run the SOCKS5 server on the default port (1080)
 #[tracing::instrument(name = "server")]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1080").await?;
-    tracing::info!("SOCKS5 server listening on 127.0.0.1:1080");
+    run_on_port(1080).await
+}
+
+/// Run the SOCKS5 server on a specific port
+///
+/// This function is used for both production and testing.
+/// For tests, use a port in the range 10000+ to avoid conflicts.
+#[tracing::instrument(name = "server", skip())]
+pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("SOCKS5 server listening on {}", addr);
 
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
 
+    // Graceful shutdown configuration
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Setup SIGTERM handler (Unix only)
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     loop {
         tokio::select! {
+            // Accept new connections
             result = listener.accept() => {
                 match result {
                     Ok((socket, remote_peer)) => {
@@ -367,26 +390,49 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
+            // Handle SIGINT (Ctrl+C)
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Shutting down...");
+                tracing::info!("Received SIGINT, initiating graceful shutdown...");
+                break;
+            }
+            // Handle SIGTERM (Unix only)
+            _ = sigterm.recv(), if cfg!(unix) => {
+                tracing::info!("Received SIGTERM, initiating graceful shutdown...");
                 break;
             }
         }
     }
 
-    // Wait for all tasks to complete
-    while let Some(res) = join_set.join_next().await {
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::error!("Connection error: {}", err);
+    // Graceful shutdown with timeout
+    let active_connections = join_set.len();
+    tracing::info!("Waiting for {} active connections to close (timeout: {:?})...",
+                   active_connections, SHUTDOWN_TIMEOUT);
+
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!("Connection completed with error: {}", err);
+                }
+                Err(err) => {
+                    tracing::debug!("Task cancelled: {}", err);
+                }
             }
-            Err(err) => {
-                tracing::error!("Task joining error: {}", err);
-            }
+        }
+    }).await {
+        Ok(()) => {
+            tracing::info!("All {} connections closed gracefully", active_connections);
+        }
+        Err(_) => {
+            tracing::warn!("Timeout waiting for connections to close, aborting {} tasks...",
+                          join_set.len());
+            join_set.abort_all();
+            // Give aborted tasks a moment to clean up
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    tracing::info!("All tasks completed.");
+    tracing::info!("SOCKS5 server shutdown complete");
     Ok(())
 }

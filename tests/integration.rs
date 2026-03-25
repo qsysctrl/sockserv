@@ -1,12 +1,14 @@
 //! Integration tests for SOCKS5 server
 //!
 //! These tests verify the complete SOCKS5 handshake and request/response flow
-//! by spawning a real server and connecting to it as a client.
+//! by spawning a real server using `server::run_on_port()` and connecting to it as a client.
 
 use bytes::{BufMut, BytesMut};
-use std::net::SocketAddr;
+use sockserv::server;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 // ============================================================================
 // Helper Functions
@@ -41,18 +43,11 @@ async fn send_connect_request(
     stream.write_all(&buf).await
 }
 
-/// Read SOCKS5 response
-async fn read_socks_response(stream: &mut TcpStream) -> std::io::Result<(u8, u8, u8, u8)> {
-    let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf).await?;
-    Ok((buf[0], buf[1], buf[2], buf[3]))
-}
-
-/// Read full response including address
+/// Read full SOCKS5 response including address
 async fn read_full_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf).await?;
-    
+
     let atyp = buf[3];
     let addr_len = match atyp {
         0x01 => 6,  // IPv4: 4 bytes IP + 2 bytes port
@@ -65,15 +60,46 @@ async fn read_full_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> 
         0x04 => 18, // IPv6: 16 bytes IP + 2 bytes port
         _ => 0,
     };
-    
+
     let mut full_response = vec![buf[0], buf[1], buf[2], buf[3]];
     if addr_len > 0 {
         let mut addr_buf = vec![0u8; addr_len];
         stream.read_exact(&mut addr_buf).await?;
         full_response.extend(addr_buf);
     }
-    
+
     Ok(full_response)
+}
+
+/// Start a test server on the given port and return a handle to the server task
+async fn start_test_server(port: u16) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = server::run_on_port(port).await;
+    })
+}
+
+/// Start a mock target server that accepts connections and sends a simple response
+async fn start_mock_target_server() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    
+    let handle = tokio::spawn(async move {
+        // Accept one connection and keep it open briefly
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Send some data to simulate a working connection
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    
+    (port, handle)
+}
+
+/// Helper to find an available port for testing
+async fn find_available_port() -> u16 {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 // ============================================================================
@@ -83,500 +109,405 @@ async fn read_full_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> 
 /// Test successful handshake with NO_AUTH authentication
 #[tokio::test]
 async fn test_handshake_no_auth() {
-    // Start server on random port
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    // Initialize tracing for test output (optional, can be removed)
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // Find available port and start server
+    let socks_port = find_available_port().await;
+    let server_handle = start_test_server(socks_port).await;
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect as client
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+        .await
+        .expect("Failed to connect to server");
+
+    // Send client hello with NO_AUTH
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+
+    // Read server hello
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0x00); // NO_AUTH
+
+    // Send CONNECT request to 127.0.0.1:80 (will fail - connection refused)
+    let addr_bytes = [
+        0x01, // ATYP IPv4
+        127, 0, 0, 1,
+        0x00, 80,
+    ];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should get ConnectionRefused (0x05) since nothing listens on port 80
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05); // Version
+    assert_eq!(response[1], 0x05); // ConnectionRefused
+
+    // Cleanup: abort server task
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+/// Test successful connection to a mock target server
+#[tokio::test]
+async fn test_connect_success() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    // Start mock target server
+    let (target_port, target_handle) = start_mock_target_server().await;
     
-    // Spawn server task
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Read client hello
-        let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n >= 3);
-        assert_eq!(buf[0], 0x05); // SOCKS5 version
-        assert!(buf[1] > 0); // At least one method
-        
-        // Send server hello (NO_AUTH)
-        let response = [0x05, 0x00];
-        stream.write_all(&response).await.unwrap();
-        
-        // Read request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n >= 10);
-        assert_eq!(buf[0], 0x05); // SOCKS5 version
-        assert_eq!(buf[1], 0x01); // CMD_CONNECT
-        
-        // Send success response
-        let response = [
-            0x05, 0x00, 0x00, // VER, REP, RSV
-            0x01, // ATYP IPv4
-            127, 0, 0, 1, // IP
-            0x00, 0x50, // Port 80
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
+    // Start SOCKS server
+    let socks_port = find_available_port().await;
+    let server_handle = start_test_server(socks_port).await;
     
-    // Client side
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Send client hello with NO_AUTH
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        
-        // Read server hello
-        let (version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(version, 0x05);
-        assert_eq!(method, 0x00); // NO_AUTH
-        
-        // Send CONNECT request to 127.0.0.1:80
-        let addr_bytes = [
-            0x01, // ATYP IPv4
-            127, 0, 0, 1,
-            0x00, 80,
-        ];
-        send_connect_request(&mut stream, &addr_bytes).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[0], 0x05); // Version
-        assert_eq!(response[1], 0x00); // Success
-    });
-    
-    // Wait for both tasks
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0x00);
+
+    // Send CONNECT to mock target
+    let addr_bytes = [
+        0x01, // ATYP IPv4
+        127, 0, 0, 1,
+        (target_port >> 8) as u8,
+        (target_port & 0xFF) as u8,
+    ];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should be success
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00); // Success
+    assert_eq!(response[3], 0x01); // IPv4
+
+    // Cleanup
+    server_handle.abort();
+    target_handle.abort();
+    let _ = server_handle.await;
+    let _ = target_handle.await;
 }
 
 /// Test handshake rejection when no acceptable methods
 #[tokio::test]
 async fn test_handshake_no_acceptable_methods() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
 
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Read client hello
-        let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).await.unwrap();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
 
-        // Client only sent GSSAPI (0x01), we don't support it
-        assert_eq!(buf[0], 0x05);
-        assert_eq!(buf[1], 1);
-        assert_eq!(buf[2], 0x01); // GSSAPI
+    // Send client hello with only GSSAPI (0x01) - not supported
+    send_client_hello(&mut stream, &[0x01]).await.unwrap();
 
-        // Send NO_ACCEPTABLE_METHODS
-        let response = [0x05, 0xFF];
-        stream.write_all(&response).await.unwrap();
+    // Read server hello - should get NO_ACCEPTABLE_METHODS (0xFF)
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0xFF); // NO_ACCEPTABLE_METHODS
 
-        // Server closes connection after sending NO_ACCEPTABLE_METHODS
-        drop(stream);
-    });
+    // Server should close connection after sending NO_ACCEPTABLE_METHODS
+    // Verify by trying to read - should get EOF
+    let mut buf = [0u8; 1];
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        stream.read(&mut buf)
+    ).await;
 
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
+    // Should get EOF (0 bytes) or error (connection closed)
+    assert!(result.is_err() || result.unwrap().map(|n| n == 0).unwrap_or(true));
 
-        // Send client hello with only GSSAPI
-        send_client_hello(&mut stream, &[0x01]).await.unwrap();
-
-        // Read server hello
-        let (version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(version, 0x05);
-        assert_eq!(method, 0xFF); // NO_ACCEPTABLE_METHODS
-
-        // According to RFC 1928, client should close connection now
-        // We verify that no further data is expected by reading until EOF
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stream.read(&mut buf)
-        ).await;
-        
-        // Should get EOF or timeout (server closed connection)
-        assert!(result.is_err() || result.unwrap().map(|n| n == 0).unwrap_or(true));
-    });
-
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    server_handle.abort();
+    let _ = server_handle.await;
 }
 
-/// Test CONNECT request with IPv4 address
+/// Test CONNECT request with IPv4 address (connection refused case)
 #[tokio::test]
-async fn test_connect_ipv4() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Handshake
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(buf[0], 0x05);
-        assert_eq!(buf[1], 0x01); // CONNECT
-        assert_eq!(buf[3], 0x01); // IPv4
-        
-        // Extract target address
-        let target_ip = format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]);
-        let target_port = u16::from_be_bytes([buf[8], buf[9]]);
-        
-        assert_eq!(target_ip, "192.168.1.100");
-        assert_eq!(target_port, 8080);
-        
-        // Send success response with bound address
-        let response = [
-            0x05, 0x00, 0x00, // VER, REP, RSV
-            0x01, // ATYP IPv4
-            10, 0, 0, 1, // Bound IP
-            0x04, 0x38, // Bound port 1080
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
-    
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Handshake
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        let (version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(version, 0x05);
-        assert_eq!(method, 0x00);
-        
-        // Send CONNECT to 192.168.1.100:8080
-        let addr_bytes = [
-            0x01, // ATYP IPv4
-            192, 168, 1, 100,
-            0x1F, 0x90, // 8080
-        ];
-        send_connect_request(&mut stream, &addr_bytes).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[0], 0x05);
-        assert_eq!(response[1], 0x00); // Success
-        assert_eq!(response[3], 0x01); // IPv4
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+async fn test_connect_ipv4_refused() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0x00);
+
+    // Send CONNECT to 127.0.0.1:1 (port 1 is typically closed)
+    // Using localhost to ensure the connection attempt is made locally
+    let addr_bytes = [
+        0x01, // ATYP IPv4
+        127, 0, 0, 1,
+        0x00, 0x01, // Port 1 (typically closed)
+    ];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should get an error code
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    // Reply code should be an error (not success)
+    // Common codes: 0x03 (NetworkUnreachable), 0x04 (HostUnreachable), 
+    // 0x05 (ConnectionRefused), 0x01 (GeneralFailure)
+    assert_ne!(response[1], 0x00, "Expected error response, got success");
+
+    server_handle.abort();
+    let _ = server_handle.await;
 }
 
 /// Test CONNECT request with domain name
 #[tokio::test]
 async fn test_connect_domain() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    // Start mock target server
+    let (target_port, target_handle) = start_mock_target_server().await;
     
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Handshake
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(buf[0], 0x05);
-        assert_eq!(buf[1], 0x01); // CONNECT
-        assert_eq!(buf[3], 0x03); // Domain
-        
-        // Extract domain
-        let domain_len = buf[4] as usize;
-        let domain = String::from_utf8(buf[5..5 + domain_len].to_vec()).unwrap();
-        let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
-        
-        assert_eq!(domain, "example.com");
-        assert_eq!(port, 443);
-        
-        // Send success response
-        let response = [
-            0x05, 0x00, 0x00,
-            0x01, 0, 0, 0, 0, 0, 0,
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
+    // Start SOCKS server
+    let socks_port = find_available_port().await;
+    let server_handle = start_test_server(socks_port).await;
     
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Handshake
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        let (_version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(method, 0x00);
-        
-        // Send CONNECT to example.com:443
-        let mut addr_bytes = vec![0x03, 11]; // ATYP Domain, len=11
-        addr_bytes.extend_from_slice(b"example.com");
-        addr_bytes.extend_from_slice(&[0x01, 0xBB]); // Port 443
-        
-        send_connect_request(&mut stream, &addr_bytes).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[0], 0x05);
-        assert_eq!(response[1], 0x00); // Success
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (_version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(method, 0x00);
+
+    // Send CONNECT to localhost with target port
+    let mut addr_bytes = vec![0x03, 9]; // ATYP Domain, len=9
+    addr_bytes.extend_from_slice(b"127.0.0.1");
+    addr_bytes.extend_from_slice(&[(target_port >> 8) as u8, (target_port & 0xFF) as u8]);
+
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should be success
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00); // Success
+
+    server_handle.abort();
+    target_handle.abort();
+    let _ = server_handle.await;
+    let _ = target_handle.await;
 }
 
-/// Test CONNECT request with IPv6 address
+/// Test CONNECT request with IPv6 address (localhost)
 #[tokio::test]
 async fn test_connect_ipv6() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    // Start mock target server on IPv6
+    let listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let target_port = listener.local_addr().unwrap().port();
     
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Handshake
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(buf[0], 0x05);
-        assert_eq!(buf[1], 0x01); // CONNECT
-        assert_eq!(buf[3], 0x04); // IPv6
-        
-        // Send success response
-        let response = [
-            0x05, 0x00, 0x00,
-            0x04, // IPv6
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // ::1
-            0x1F, 0x90, // Port 8080
-        ];
-        stream.write_all(&response).await.unwrap();
+    let target_handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream.write_all(b"OK").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     });
     
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Handshake
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        let (_version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(method, 0x00);
-        
-        // Send CONNECT to ::1:8080
-        let addr_bytes = [
-            0x04, // ATYP IPv6
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            0x1F, 0x90, // 8080
-        ];
-        send_connect_request(&mut stream, &addr_bytes).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[0], 0x05);
-        assert_eq!(response[1], 0x00); // Success
-        assert_eq!(response[3], 0x04); // IPv6
-    });
+    // Start SOCKS server
+    let socks_port = find_available_port().await;
+    let server_handle = start_test_server(socks_port).await;
     
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (_version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(method, 0x00);
+
+    // Send CONNECT to ::1 with target port
+    let addr_bytes = [
+        0x04, // ATYP IPv6
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // ::1
+        (target_port >> 8) as u8,
+        (target_port & 0xFF) as u8,
+    ];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should be success
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00); // Success
+    assert_eq!(response[3], 0x04); // IPv6
+
+    server_handle.abort();
+    target_handle.abort();
+    let _ = server_handle.await;
+    let _ = target_handle.await;
 }
 
 /// Test multiple auth methods - server selects NO_AUTH
 #[tokio::test]
 async fn test_multiple_auth_methods() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Read client hello with multiple methods
-        let mut buf = [0x05, 0x03, 0x01, 0x00, 0x02]; // GSSAPI, NO_AUTH, USERNAME/PASSWORD
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n >= 5);
-        
-        // Server should select NO_AUTH (0x00)
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read request and respond
-        let _ = stream.read(&mut buf).await.unwrap();
-        let response = [
-            0x05, 0x00, 0x00,
-            0x01, 0, 0, 0, 0, 0, 0,
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
-    
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Send multiple methods: GSSAPI, NO_AUTH, USERNAME/PASSWORD
-        send_client_hello(&mut stream, &[0x01, 0x00, 0x02]).await.unwrap();
-        
-        // Server should select NO_AUTH
-        let (version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(version, 0x05);
-        assert_eq!(method, 0x00); // NO_AUTH selected
-        
-        // Send request
-        let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
-        send_connect_request(&mut stream, &addr_bytes).await.unwrap();
-        
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[1], 0x00); // Success
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Send multiple methods: GSSAPI, NO_AUTH, USERNAME/PASSWORD
+    send_client_hello(&mut stream, &[0x01, 0x00, 0x02]).await.unwrap();
+
+    // Server should select NO_AUTH
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0x00); // NO_AUTH selected
+
+    // Send request to non-existent target (will fail)
+    let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
+    // Read response - should be error (connection refused or network unreachable)
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    assert!(response[1] != 0x00); // Should be an error, not success
+
+    server_handle.abort();
+    let _ = server_handle.await;
 }
 
 /// Test invalid SOCKS version
 #[tokio::test]
 async fn test_invalid_version() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Read invalid version
-        let mut buf = [0u8; 2];
-        let _n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(_n, 2);
-        assert_eq!(buf[0], 0x04); // SOCKS4 version (invalid for us)
-        
-        // We should close without response or send error
-    });
-    
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Send SOCKS4 version (should be rejected)
-        let buf = [0x04, 0x01, 0x00];
-        stream.write_all(&buf).await.unwrap();
-        
-        // Should not receive valid response - use timeout
-        let mut response = [0u8; 2];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stream.read(&mut response)
-        ).await;
-        
-        // Should timeout or connection closed
-        assert!(result.is_err() || result.unwrap().is_err());
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Send SOCKS4 version (should be rejected)
+    let buf = [0x04, 0x01, 0x00];
+    stream.write_all(&buf).await.unwrap();
+
+    // Server should close connection without response for invalid version
+    // Try to read - should get EOF (0 bytes) since server closes connection
+    let mut response = [0u8; 2];
+    let read_result = tokio::time::timeout(
+        Duration::from_millis(200),
+        stream.read(&mut response)
+    ).await;
+
+    match read_result {
+        Ok(Ok(0)) => {
+            // EOF - server closed connection (expected behavior)
+        }
+        Ok(Ok(n)) => {
+            // Got some data - this is unexpected but might happen
+            // Just verify it's not a valid SOCKS5 response
+            assert_ne!(response[0], 0x05, "Should not get valid SOCKS5 response for invalid version");
+        }
+        Ok(Err(_)) => {
+            // Connection error - also acceptable
+        }
+        Err(_) => {
+            // Timeout - server didn't respond and didn't close (unexpected)
+            panic!("Timeout waiting for server response - expected connection close");
+        }
+    }
+
+    server_handle.abort();
+    let _ = server_handle.await;
 }
 
 /// Test unsupported command (BIND)
 #[tokio::test]
 async fn test_unsupported_command_bind() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Handshake
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read BIND request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(buf[1], 0x02); // BIND
-        
-        // Send command not supported
-        let response = [
-            0x05, 0x07, 0x00, // VER, REP(7=not supported), RSV
-            0x01, 0, 0, 0, 0, 0, 0,
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
-    
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Handshake
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        let (_version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(method, 0x00);
-        
-        // Send BIND request
-        let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
-        let mut buf = vec![0x05, 0x02, 0x00]; // CMD_BIND
-        buf.extend_from_slice(&addr_bytes);
-        stream.write_all(&buf).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[1], 0x07); // Command not supported
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (_version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(method, 0x00);
+
+    // Send BIND request
+    let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
+    let mut buf = vec![0x05, 0x02, 0x00]; // CMD_BIND
+    buf.extend_from_slice(&addr_bytes);
+    stream.write_all(&buf).await.unwrap();
+
+    // Read response
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[1], 0x07); // Command not supported
+
+    server_handle.abort();
+    let _ = server_handle.await;
 }
 
 /// Test unsupported command (UDP ASSOCIATE)
 #[tokio::test]
 async fn test_unsupported_command_udp() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    let server_handle = tokio::spawn(async move {
-        let (mut stream, _peer) = listener.accept().await.unwrap();
-        
-        // Handshake
-        let mut buf = [0u8; 256];
-        let _ = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
-        
-        // Read UDP ASSOCIATE request
-        let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(buf[1], 0x03); // UDP ASSOCIATE
-        
-        // Send command not supported
-        let response = [
-            0x05, 0x07, 0x00,
-            0x01, 0, 0, 0, 0, 0, 0,
-        ];
-        stream.write_all(&response).await.unwrap();
-    });
-    
-    let client_handle = tokio::spawn(async move {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        
-        // Handshake
-        send_client_hello(&mut stream, &[0x00]).await.unwrap();
-        let (_version, method) = read_server_hello(&mut stream).await.unwrap();
-        assert_eq!(method, 0x00);
-        
-        // Send UDP ASSOCIATE request
-        let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
-        let mut buf = vec![0x05, 0x03, 0x00]; // CMD_UDP_ASSOCIATE
-        buf.extend_from_slice(&addr_bytes);
-        stream.write_all(&buf).await.unwrap();
-        
-        // Read response
-        let response = read_full_response(&mut stream).await.unwrap();
-        assert_eq!(response[1], 0x07); // Command not supported
-    });
-    
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    server_result.unwrap();
-    client_result.unwrap();
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let server_handle = start_test_server(port).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Handshake
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (_version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(method, 0x00);
+
+    // Send UDP ASSOCIATE request
+    let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
+    let mut buf = vec![0x05, 0x03, 0x00]; // CMD_UDP_ASSOCIATE
+    buf.extend_from_slice(&addr_bytes);
+    stream.write_all(&buf).await.unwrap();
+
+    // Read response
+    let response = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(response[1], 0x07); // Command not supported
+
+    server_handle.abort();
+    let _ = server_handle.await;
 }
