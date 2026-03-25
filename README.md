@@ -30,16 +30,65 @@ A high-performance, reliable SOCKS5 proxy server implementation in Rust, built w
 ## Supported Features
 
 - ✅ NO_AUTH authentication method
-- ✅ CONNECT command
+- ✅ CONNECT command with TCP relay
 - ✅ IPv4, IPv6, and Domain name address types
 - ✅ Proper error codes and responses
+- ✅ DNS resolution for domain names
+- ✅ 10-second connection timeout (DoS protection)
+- ✅ Bidirectional data relay
 
-## Unsupported Features
+## Roadmap (TODO)
 
-- ❌ GSSAPI authentication
-- ❌ Username/Password authentication  
-- ❌ BIND command
-- ❌ UDP ASSOCIATE command
+### High Priority
+
+- [ ] **BIND command support** - RFC 1928 section 4.6.2
+- [ ] **UDP ASSOCIATE support** - RFC 1928 section 4.6.3
+- [ ] **Username/Password authentication** - RFC 1929
+
+### Medium Priority
+
+- [ ] **Configuration file support** - TOML/YAML config
+  - [ ] Listen address/port
+  - [ ] Authentication methods
+  - [ ] Connection timeouts
+  - [ ] Logging configuration
+- [ ] **Access control lists (ACL)**
+  - [ ] IP whitelist/blacklist
+  - [ ] Domain filtering
+  - [ ] Port restrictions
+  - [ ] Per-IP connection limits
+- [ ] **Rate limiting**
+  - [ ] Requests per second
+  - [ ] Bandwidth limits
+  - [ ] Per-IP rate limiting
+  - [ ] Connection rate limiting
+
+### Low Priority
+
+- [ ] **Metrics/Monitoring**
+  - [ ] Prometheus metrics endpoint
+  - [ ] OpenMetrics format
+  - [ ] Connection counters
+  - [ ] Bytes transferred stats
+  - [ ] Error rate tracking
+- [ ] **GSSAPI authentication** - RFC 1961
+- [ ] **IPv6-only mode** - Disable IPv4
+- [ ] **Proxy Protocol v2** - Client IP preservation
+- [ ] **TLS/SSL support** - Encrypted SOCKS5
+
+### Future Enhancements
+
+- [ ] **Web admin panel** - Real-time monitoring
+- [ ] **GeoIP filtering** - Block/allow by country
+- [ ] **Logging backends**
+  - [ ] JSON structured logging
+  - [ ] ELK stack integration
+  - [ ] Remote syslog
+- [ ] **Cluster mode** - Multiple instances
+- [ ] **Hot reload** - Config without restart
+- [ ] **eBPF metrics** - Kernel-level observability
+
+---
 
 ## Quick Start
 
