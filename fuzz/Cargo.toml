@@ -1,0 +1,36 @@
+[package]
+name = "sockserv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sockserv = { path = ".." }
+
+[[bin]]
+name = "fuzz_client_hello"
+path = "fuzz_targets/fuzz_client_hello.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_request"
+path = "fuzz_targets/fuzz_request.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_response"
+path = "fuzz_targets/fuzz_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_address"
+path = "fuzz_targets/fuzz_address.rs"
+test = false
+doc = false

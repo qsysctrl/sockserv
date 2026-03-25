@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # SOCKS5 Server
+  socks-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: socks-server
+    ports:
+      - "1080:1080"
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - socks-network
+
+  # Load testing client with curl and Python
+  load-tester:
+    image: python:3.11-slim
+    container_name: socks-load-tester
+    depends_on:
+      - socks-server
+    environment:
+      - SOCKS_HOST=socks-server
+      - SOCKS_PORT=1080
+      - TEST_DURATION=60
+      - CONCURRENT_CONNECTIONS=10
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts
+    command: >
+      bash -c "
+        pip install --no-cache-dir aiohttp socksio &&
+        python load_test.py
+      "
+    networks:
+      - socks-network
+
+  # Alternative: Use hey or vegeta for HTTP load testing through SOCKS
+  # Uncomment if you want to test HTTP traffic through SOCKS
+  # http-load-tester:
+  #   image: rakyll/hey
+  #   container_name: http-load-tester
+  #   depends_on:
+  #     - socks-server
+  #   command: >
+  #     -c 50 -n 1000 -socks-proxy http://socks-server:1080
+  #     http://httpbin.org/delay/1
+  #   networks:
+  #     - socks-network
+
+  # Network traffic generator using iperf3 (for raw TCP testing)
+  # Uncomment for raw TCP performance testing
+  # iperf3-server:
+  #   image: networkstatic/iperf3
+  #   container_name: iperf3-server
+  #   command: -s
+  #   networks:
+  #     - socks-network
+
+networks:
+  socks-network:
+    driver: bridge

@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/target/
+
+# Cargo
+Cargo.lock
+
+# Build output for release
+*.rlib
+
+# Debug
+*.pdb
+
+# Environment
+.env
+.venv
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+benchmark_results_*/
+test_proxychains.conf
+
+# Qwen
+.qwen/
+
+# Benchmark output
+benchmark_output.log
