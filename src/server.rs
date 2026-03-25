@@ -1,4 +1,4 @@
-mod protocol;
+pub mod protocol;
 
 use protocol::{
     AuthMethod, ClientHello, ReplyCode, ServerHello, SocksAddress, SocksCommand, SocksError,

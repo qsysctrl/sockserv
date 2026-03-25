@@ -107,12 +107,6 @@ pub enum SocksCommand {
     UdpAssociate = 0x03,
 }
 
-impl SocksCommand {
-    pub const CONNECT: u8 = 0x01;
-    pub const BIND: u8 = 0x02;
-    pub const UDP_ASSOCIATE: u8 = 0x03;
-}
-
 impl TryFrom<u8> for SocksCommand {
     type Error = SocksError;
 
@@ -148,16 +142,6 @@ pub enum ReplyCode {
 }
 
 impl ReplyCode {
-    pub const SUCCESS: u8 = 0x00;
-    pub const GENERAL_FAILURE: u8 = 0x01;
-    pub const CONNECTION_NOT_ALLOWED: u8 = 0x02;
-    pub const NETWORK_UNREACHABLE: u8 = 0x03;
-    pub const HOST_UNREACHABLE: u8 = 0x04;
-    pub const CONNECTION_REFUSED: u8 = 0x05;
-    pub const TTL_EXPIRED: u8 = 0x06;
-    pub const COMMAND_NOT_SUPPORTED: u8 = 0x07;
-    pub const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
-
     /// Check if this reply code indicates success
     pub fn is_success(self) -> bool {
         matches!(self, ReplyCode::Success)
@@ -376,7 +360,8 @@ impl SocksAddress {
                 if buf.len() < 2 + domain_len + 2 {
                     return Err(SocksError::BufferTooShort);
                 }
-                // Zero-copy UTF-8 validation: avoid intermediate Vec allocation
+                // UTF-8 validation with single allocation (to_string)
+                // Avoids intermediate Vec<u8> allocation
                 let domain = str::from_utf8(&buf[2..2 + domain_len])
                     .map_err(|_| SocksError::InvalidMessageFormat)?
                     .to_string();
@@ -482,7 +467,8 @@ impl SocksRequest {
     /// Serialize request to bytes
     pub fn serialize(&self) -> Bytes {
         let addr_bytes = self.address.serialize();
-        let mut buf = BytesMut::with_capacity(4 + addr_bytes.len() - 1);
+        // Request: VER(1) + CMD(1) + RSV(1) + addr_bytes
+        let mut buf = BytesMut::with_capacity(3 + addr_bytes.len());
         buf.put_u8(self.version);
         buf.put_u8(self.command as u8);
         buf.put_u8(RSV);
@@ -522,7 +508,8 @@ impl SocksRequest {
                 let mut domain = vec![0u8; domain_len];
                 reader.read_exact(&mut domain).await?;
                 let port = reader.read_u16().await?;
-                // Zero-copy UTF-8 validation
+                // UTF-8 validation with single allocation (to_string)
+                // Avoids intermediate Vec<u8> allocation
                 let domain_str = str::from_utf8(&domain)
                     .map_err(|_| SocksError::InvalidMessageFormat)?
                     .to_string();
@@ -594,7 +581,8 @@ impl SocksResponse {
     /// Serialize response to bytes
     pub fn serialize(&self) -> Bytes {
         let addr_bytes = self.address.serialize();
-        let mut buf = BytesMut::with_capacity(4 + addr_bytes.len() - 1);
+        // Response: VER(1) + REP(1) + RSV(1) + addr_bytes
+        let mut buf = BytesMut::with_capacity(3 + addr_bytes.len());
         buf.put_u8(self.version);
         buf.put_u8(self.reply as u8);
         buf.put_u8(RSV);
