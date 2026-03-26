@@ -240,6 +240,7 @@ pub struct ClientHello {
 
 impl ClientHello {
     /// Parse client hello from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 2 {
             return Err(SocksError::BufferTooShort);
@@ -317,6 +318,7 @@ impl ServerHello {
     }
 
     /// Parse server hello from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 2 {
             return Err(SocksError::BufferTooShort);
@@ -366,6 +368,7 @@ impl SocksAddress {
     const MAX_DOMAIN_LEN: usize = 255;
 
     /// Parse address from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.is_empty() {
             return Err(SocksError::BufferTooShort);
@@ -471,6 +474,7 @@ pub struct SocksRequest {
 
 impl SocksRequest {
     /// Parse request from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 4 {
             return Err(SocksError::BufferTooShort);
@@ -596,6 +600,7 @@ impl SocksResponse {
     }
 
     /// Parse response from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 4 {
             return Err(SocksError::BufferTooShort);

@@ -21,6 +21,9 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for connecting to remote servers (prevents hanging on slow/unreachable hosts)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Total connection timeout (prevents hanging connections)
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Maximum concurrent connections (prevents DoS)
 const MAX_CONCURRENT_CONNECTIONS: usize = 10_000;
 
@@ -155,78 +158,82 @@ impl Connection {
         ),
     )]
     async fn process(self) -> Result<(), SocksError> {
-        tracing::debug!("Session start");
+        tokio::time::timeout(CONNECTION_TIMEOUT, async {
+            tracing::debug!("Session start");
 
-        // Perform handshake
-        let (mut read_half, mut write_half) = self.socket.into_split();
+            // Perform handshake
+            let (mut read_half, mut write_half) = self.socket.into_split();
 
-        // Step 1: Read client hello
-        let client_hello = Self::read_client_hello(&mut read_half).await?;
-        tracing::debug!(
-            methods = ?client_hello.methods.iter().map(|m| m.0).collect::<Vec<_>>(),
-            "Received client hello"
-        );
+            // Step 1: Read client hello
+            let client_hello = Self::read_client_hello(&mut read_half).await?;
+            tracing::debug!(
+                methods = ?client_hello.methods.iter().map(|m| m.0).collect::<Vec<_>>(),
+                "Received client hello"
+            );
 
-        // Step 2: Select authentication method (we only support NO_AUTH)
-        let selected_method = Self::select_auth_method(&client_hello);
-        tracing::debug!(method = selected_method.0, "Selected auth method");
+            // Step 2: Select authentication method (we only support NO_AUTH)
+            let selected_method = Self::select_auth_method(&client_hello);
+            tracing::debug!(method = selected_method.0, "Selected auth method");
 
-        // Step 3: Send server hello
-        Self::send_server_hello(&mut write_half, selected_method).await?;
+            // Step 3: Send server hello
+            Self::send_server_hello(&mut write_half, selected_method).await?;
 
-        // If no acceptable methods, close connection
-        if selected_method == AuthMethod::NO_ACCEPTABLE {
-            tracing::info!("No acceptable auth methods, closing connection");
-            return Ok(());
-        }
-
-        // Step 4: Read SOCKS request
-        let request = Self::read_request(&mut read_half).await?;
-        tracing::debug!(
-            command = request.command as u8,
-            address = ?request.address,
-            "Received SOCKS request"
-        );
-
-        // Step 5: Process request and establish connection to target
-        let result = Self::process_request(&request, &self.remote_peer).await;
-
-        match result {
-            Ok((response, Some(remote_stream))) => {
-                // Successful connection - send response and start relay
-                tracing::debug!(reply = response.reply as u8, "Sending SOCKS response");
-                Self::send_response(&mut write_half, &response).await?;
-
-                tracing::debug!("Starting data relay");
-                // Recombine the client socket halves for bidirectional relay
-                let mut client_stream = read_half.reunite(write_half)
-                    .map_err(|_| SocksError::InvalidRequest)?;
-
-                Self::relay_data(&mut client_stream, remote_stream).await;
+            // If no acceptable methods, close connection
+            if selected_method == AuthMethod::NO_ACCEPTABLE {
+                tracing::info!("No acceptable auth methods, closing connection");
+                return Ok(());
             }
-            Ok((response, None)) => {
-                // Failed connection - send error response and close
-                tracing::debug!(reply = response.reply as u8, "Sending error response");
-                Self::send_response(&mut write_half, &response).await?;
-            }
-            Err(e) => {
-                // Error during request processing
-                let reply_code = match &e {
-                    SocksError::ConnectionRefused => ReplyCode::ConnectionRefused,
-                    SocksError::NetworkUnreachable => ReplyCode::NetworkUnreachable,
-                    SocksError::HostUnreachable => ReplyCode::HostUnreachable,
-                    SocksError::TtlExpired => ReplyCode::TtlExpired,
-                    SocksError::ConnectionNotAllowed => ReplyCode::ConnectionNotAllowed,
-                    _ => ReplyCode::GeneralFailure,
-                };
-                let response = SocksResponse::new(reply_code, Self::get_unspec_address());
-                tracing::debug!(reply = response.reply as u8, "Sending error response");
-                Self::send_response(&mut write_half, &response).await?;
-            }
-        }
 
-        tracing::debug!("Session end");
-        Ok(())
+            // Step 4: Read SOCKS request
+            let request = Self::read_request(&mut read_half).await?;
+            tracing::debug!(
+                command = request.command as u8,
+                address = ?request.address,
+                "Received SOCKS request"
+            );
+
+            // Step 5: Process request and establish connection to target
+            let result = Self::process_request(&request, &self.remote_peer).await;
+
+            match result {
+                Ok((response, Some(remote_stream))) => {
+                    // Successful connection - send response and start relay
+                    tracing::debug!(reply = response.reply as u8, "Sending SOCKS response");
+                    Self::send_response(&mut write_half, &response).await?;
+
+                    tracing::debug!("Starting data relay");
+                    // Recombine the client socket halves for bidirectional relay
+                    let mut client_stream = read_half.reunite(write_half)
+                        .map_err(|_| SocksError::InvalidRequest)?;
+
+                    Self::relay_data(&mut client_stream, remote_stream).await;
+                }
+                Ok((response, None)) => {
+                    // Failed connection - send error response and close
+                    tracing::debug!(reply = response.reply as u8, "Sending error response");
+                    Self::send_response(&mut write_half, &response).await?;
+                }
+                Err(e) => {
+                    // Error during request processing
+                    let reply_code = match &e {
+                        SocksError::ConnectionRefused => ReplyCode::ConnectionRefused,
+                        SocksError::NetworkUnreachable => ReplyCode::NetworkUnreachable,
+                        SocksError::HostUnreachable => ReplyCode::HostUnreachable,
+                        SocksError::TtlExpired => ReplyCode::TtlExpired,
+                        SocksError::ConnectionNotAllowed => ReplyCode::ConnectionNotAllowed,
+                        _ => ReplyCode::GeneralFailure,
+                    };
+                    let response = SocksResponse::new(reply_code, Self::get_unspec_address());
+                    tracing::debug!(reply = response.reply as u8, "Sending error response");
+                    Self::send_response(&mut write_half, &response).await?;
+                }
+            }
+
+            tracing::debug!("Session end");
+            Ok(())
+        })
+        .await
+        .map_err(|_| SocksError::IoError("Connection timeout".into()))?
     }
 
     /// Read client hello message with timeout to prevent Slowloris attacks
