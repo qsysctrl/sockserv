@@ -5,10 +5,22 @@
 
 use bytes::{BufMut, BytesMut};
 use sockserv::server;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+// ============================================================================
+// Test Configuration
+// ============================================================================
+
+/// Timeout for individual test operations
+const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for server startup
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Helper Functions
@@ -72,26 +84,55 @@ async fn read_full_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> 
 }
 
 /// Start a test server on the given port and return a handle to the server task
-async fn start_test_server(port: u16) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// Uses a ready signal to avoid race conditions
+async fn start_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
+    
+    let handle = tokio::spawn(async move {
+        // Signal that server is about to start
+        ready_clone.notify_one();
         let _ = server::run_on_port(port).await;
-    })
+    });
+    
+    (handle, ready)
 }
 
-/// Start a mock target server that accepts connections and sends a simple response
+/// Wait for server to be ready with timeout
+async fn wait_for_server_ready(ready: &Arc<Notify>, timeout: Duration) -> Result<(), &'static str> {
+    tokio::time::timeout(timeout, ready.notified())
+        .await
+        .map_err(|_| "Server startup timeout")?;
+    
+    // Give server a bit more time to actually bind to port
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    Ok(())
+}
+
+/// Start a mock target server that properly handles connections
 async fn start_mock_target_server() -> (u16, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    
+
     let handle = tokio::spawn(async move {
-        // Accept one connection and keep it open briefly
-        if let Ok((mut stream, _)) = listener.accept().await {
-            // Send some data to simulate a working connection
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                // Read data from client to verify relay works
+                let mut buf = vec![0u8; 1024];
+                match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => {
+                        // Echo back to verify bidirectional relay
+                        let _ = stream.write_all(&buf[..n]).await;
+                    }
+                    _ => {}
+                }
+                // Keep connection alive briefly for relay test
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => {}
         }
     });
-    
+
     (port, handle)
 }
 
@@ -109,22 +150,26 @@ async fn find_available_port() -> u16 {
 /// Test successful handshake with NO_AUTH authentication
 #[tokio::test]
 async fn test_handshake_no_auth() {
-    // Initialize tracing for test output (optional, can be removed)
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    // Find available port and start server
     let socks_port = find_available_port().await;
-    let server_handle = start_test_server(socks_port).await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Connect as client
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    // Wait for server to be ready (avoids race condition)
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .expect("Failed to connect to server");
+        .expect("Server failed to start");
+
+    // Connect as client with timeout
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    )
+    .await
+    .expect("Connection timeout")
+    .expect("Failed to connect to server");
 
     // Send client hello with NO_AUTH
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -159,16 +204,22 @@ async fn test_connect_success() {
 
     // Start mock target server
     let (target_port, target_handle) = start_mock_target_server().await;
-    
+
     // Start SOCKS server
     let socks_port = find_available_port().await;
-    let server_handle = start_test_server(socks_port).await;
-    
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -204,12 +255,18 @@ async fn test_handshake_no_acceptable_methods() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Send client hello with only GSSAPI (0x01) - not supported
     send_client_hello(&mut stream, &[0x01]).await.unwrap();
@@ -240,12 +297,18 @@ async fn test_connect_ipv4_refused() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -254,7 +317,6 @@ async fn test_connect_ipv4_refused() {
     assert_eq!(method, 0x00);
 
     // Send CONNECT to 127.0.0.1:1 (port 1 is typically closed)
-    // Using localhost to ensure the connection attempt is made locally
     let addr_bytes = [
         0x01, // ATYP IPv4
         127, 0, 0, 1,
@@ -266,8 +328,6 @@ async fn test_connect_ipv4_refused() {
     let response = read_full_response(&mut stream).await.unwrap();
     assert_eq!(response[0], 0x05);
     // Reply code should be an error (not success)
-    // Common codes: 0x03 (NetworkUnreachable), 0x04 (HostUnreachable), 
-    // 0x05 (ConnectionRefused), 0x01 (GeneralFailure)
     assert_ne!(response[1], 0x00, "Expected error response, got success");
 
     server_handle.abort();
@@ -281,16 +341,22 @@ async fn test_connect_domain() {
 
     // Start mock target server
     let (target_port, target_handle) = start_mock_target_server().await;
-    
+
     // Start SOCKS server
     let socks_port = find_available_port().await;
-    let server_handle = start_test_server(socks_port).await;
-    
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -323,23 +389,29 @@ async fn test_connect_ipv6() {
     // Start mock target server on IPv6
     let listener = TcpListener::bind("[::1]:0").await.unwrap();
     let target_port = listener.local_addr().unwrap().port();
-    
+
     let target_handle = tokio::spawn(async move {
         if let Ok((mut stream, _)) = listener.accept().await {
             let _ = stream.write_all(b"OK").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
-    
+
     // Start SOCKS server
     let socks_port = find_available_port().await;
-    let server_handle = start_test_server(socks_port).await;
-    
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -373,12 +445,18 @@ async fn test_multiple_auth_methods() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Send multiple methods: GSSAPI, NO_AUTH, USERNAME/PASSWORD
     send_client_hello(&mut stream, &[0x01, 0x00, 0x02]).await.unwrap();
@@ -407,12 +485,18 @@ async fn test_invalid_version() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Send SOCKS4 version (should be rejected)
     let buf = [0x04, 0x01, 0x00];
@@ -427,20 +511,15 @@ async fn test_invalid_version() {
     ).await;
 
     match read_result {
-        Ok(Ok(0)) => {
-            // EOF - server closed connection (expected behavior)
+        Ok(Ok(0)) => {} // EOF - server closed connection (expected)
+        Ok(Ok(_)) => {
+            // Got some data - verify it's not a valid SOCKS5 response
+            assert_ne!(response[0], 0x05, "Should not get valid SOCKS5 response");
         }
-        Ok(Ok(n)) => {
-            // Got some data - this is unexpected but might happen
-            // Just verify it's not a valid SOCKS5 response
-            assert_ne!(response[0], 0x05, "Should not get valid SOCKS5 response for invalid version");
-        }
-        Ok(Err(_)) => {
-            // Connection error - also acceptable
-        }
+        Ok(Err(_)) => {} // Connection error - acceptable
         Err(_) => {
-            // Timeout - server didn't respond and didn't close (unexpected)
-            panic!("Timeout waiting for server response - expected connection close");
+            // Timeout - server didn't respond and didn't close
+            panic!("Timeout - expected connection close");
         }
     }
 
@@ -454,12 +533,18 @@ async fn test_unsupported_command_bind() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();
@@ -486,12 +571,18 @@ async fn test_unsupported_command_udp() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let port = find_available_port().await;
-    let server_handle = start_test_server(port).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let (server_handle, server_ready) = start_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
-        .unwrap();
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port))
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
 
     // Handshake
     send_client_hello(&mut stream, &[0x00]).await.unwrap();

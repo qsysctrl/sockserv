@@ -4,7 +4,6 @@
 //! SOCKS5 protocol messages.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,6 +28,40 @@ pub const AUTH_NO_ACCEPTABLE: u8 = 0xFF;
 pub const ATYP_IPV4: u8 = 0x01;
 pub const ATYP_DOMAIN: u8 = 0x03;
 pub const ATYP_IPV6: u8 = 0x04;
+
+// ============================================================================
+// Validation Functions
+// ============================================================================
+
+/// Validate domain name from SOCKS request
+/// Prevents domain name injection attacks
+fn validate_domain_name(domain: &str) -> Result<()> {
+    // No null bytes (prevents injection)
+    if domain.contains('\0') {
+        return Err(SocksError::InvalidMessageFormat);
+    }
+
+    // Only allow printable ASCII for domain names
+    // This prevents various encoding attacks
+    // Allowed: alphanumeric, dots, hyphens, underscores
+    if !domain.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_'
+    }) {
+        return Err(SocksError::InvalidMessageFormat);
+    }
+
+    // Domain must start with alphanumeric
+    if !domain
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        return Err(SocksError::InvalidMessageFormat);
+    }
+
+    Ok(())
+}
 
 // ============================================================================
 // Error Types
@@ -501,18 +534,29 @@ impl SocksRequest {
             }
             ATYP_DOMAIN => {
                 let domain_len = reader.read_u8().await? as usize;
+
+                // CRITICAL FIX: Validate length BEFORE allocation
                 // RFC 1928: domain length must be 1-255
-                if domain_len == 0 || domain_len > SocksAddress::MAX_DOMAIN_LEN {
+                if domain_len == 0 {
                     return Err(SocksError::DomainNameTooLong);
                 }
+                if domain_len > SocksAddress::MAX_DOMAIN_LEN {
+                    return Err(SocksError::DomainNameTooLong);
+                }
+
+                // Allocate after validation
                 let mut domain = vec![0u8; domain_len];
                 reader.read_exact(&mut domain).await?;
                 let port = reader.read_u16().await?;
+
                 // UTF-8 validation with single allocation (to_string)
-                // Avoids intermediate Vec<u8> allocation
                 let domain_str = str::from_utf8(&domain)
                     .map_err(|_| SocksError::InvalidMessageFormat)?
                     .to_string();
+
+                // HIGH FIX: Validate domain name to prevent injection attacks
+                validate_domain_name(&domain_str)?;
+
                 SocksAddress::Domain(domain_str, port)
             }
             ATYP_IPV6 => {
@@ -816,7 +860,7 @@ mod tests {
         #[test]
         fn test_parse_ipv6_address() {
             // ATYP=0x04, IP=::1, PORT=443 (0x01BB)
-            let mut buf = [0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0xBB];
+            let buf = [0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0xBB];
             let (addr, len) = SocksAddress::parse(&buf).unwrap();
             
             assert_eq!(len, 19);
@@ -1219,7 +1263,6 @@ mod tests {
 
     mod proptests {
         use super::*;
-        use proptest::prelude::*;
 
         proptest! {
             #[test]

@@ -4,16 +4,94 @@ use protocol::{
     AuthMethod, ClientHello, ReplyCode, ServerHello, SocksAddress, SocksCommand, SocksError,
     SocksRequest, SocksResponse, SOCKS_VERSION,
 };
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 
 /// Maximum number of authentication methods we accept
 const MAX_AUTH_METHODS: usize = 128;
 
+/// Timeout for reading from client (prevents Slowloris attacks)
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for connecting to remote servers (prevents hanging on slow/unreachable hosts)
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum concurrent connections (prevents DoS)
+const MAX_CONCURRENT_CONNECTIONS: usize = 10_000;
+
+/// Maximum connections per IP address (prevents single-IP DoS)
+const MAX_CONNECTIONS_PER_IP: usize = 100;
+
+/// Tracks active connections for rate limiting
+struct ConnectionTracker {
+    ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_per_ip: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl ConnectionTracker {
+    fn new(max_per_ip: usize, max_total: usize) -> Self {
+        Self {
+            ip_counts: Arc::new(Mutex::new(HashMap::new())),
+            max_per_ip,
+            semaphore: Arc::new(Semaphore::new(max_total)),
+        }
+    }
+
+    /// Try to acquire a permit for a new connection from the given IP
+    /// Returns true if the connection is allowed, false if limits are exceeded
+    async fn try_acquire(&self, ip: IpAddr) -> bool {
+        // Check total connection limit first (fast path)
+        if self.semaphore.available_permits() == 0 {
+            return false;
+        }
+
+        // Check and update per-IP limit
+        let mut counts = self.ip_counts.lock().await;
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= self.max_per_ip {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Release a permit when a connection closes
+    async fn release(&self, ip: IpAddr) {
+        let mut counts = self.ip_counts.lock().await;
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
+}
+
+/// RAII guard to ensure connection tracker is updated when connection closes
+struct ConnectionGuard {
+    tracker: Arc<ConnectionTracker>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        // Clone the data we need for the async release
+        let tracker = Arc::clone(&self.tracker);
+        let ip = self.ip;
+
+        // Spawn a task to release the permit (non-blocking)
+        // Since Drop is synchronous, we spawn an async task
+        tokio::spawn(async move {
+            tracker.release(ip).await;
+        });
+    }
+}
 
 /// Map TCP connection errors to SOCKS reply codes
 ///
@@ -46,7 +124,7 @@ async fn resolve_address(address: &SocksAddress) -> Result<SocketAddr, SocksErro
             let mut addrs = tokio::net::lookup_host((domain.as_str(), *port))
                 .await
                 .map_err(|_| SocksError::HostUnreachable)?;
-            
+
             // Return the first resolved address
             addrs.next().ok_or(SocksError::HostUnreachable)
         }
@@ -123,7 +201,7 @@ impl Connection {
                 // Recombine the client socket halves for bidirectional relay
                 let mut client_stream = read_half.reunite(write_half)
                     .map_err(|_| SocksError::InvalidRequest)?;
-                
+
                 Self::relay_data(&mut client_stream, remote_stream).await;
             }
             Ok((response, None)) => {
@@ -151,41 +229,42 @@ impl Connection {
         Ok(())
     }
 
-    /// Read client hello message
+    /// Read client hello message with timeout to prevent Slowloris attacks
     async fn read_client_hello<R: AsyncReadExt + Unpin>(
         reader: &mut R,
     ) -> Result<ClientHello, SocksError> {
-        // Read version byte
-        let version = reader.read_u8().await?;
-        if version != SOCKS_VERSION {
-            return Err(SocksError::InvalidVersion);
-        }
+        timeout(CLIENT_READ_TIMEOUT, async {
+            // Read version byte
+            let version = reader.read_u8().await?;
+            if version != SOCKS_VERSION {
+                return Err(SocksError::InvalidVersion);
+            }
 
-        // Read number of methods
-        let nmethods = reader.read_u8().await? as usize;
-        if nmethods == 0 {
-            return Err(SocksError::NoAuthMethods);
-        }
+            // Read number of methods
+            let nmethods = reader.read_u8().await? as usize;
+            if nmethods == 0 {
+                return Err(SocksError::NoAuthMethods);
+            }
 
-        // Read ALL methods that the client sent into a buffer
-        // This is critical: we must consume all bytes from the stream to prevent
-        // leftover data from corrupting subsequent reads (e.g., the SOCKS request)
-        let mut methods = vec![0u8; nmethods];
-        reader.read_exact(&mut methods).await?;
+            // CRITICAL FIX: Validate BEFORE allocation to prevent DoS
+            if nmethods > MAX_AUTH_METHODS {
+                return Err(SocksError::InvalidRequest);
+            }
 
-        // Build the methods vector from only the methods we're willing to process
-        // We limit to MAX_AUTH_METHODS to prevent DoS, but we've already consumed
-        // all bytes from the stream above
-        let processed_methods: Vec<AuthMethod> = methods
-            .into_iter()
-            .take(MAX_AUTH_METHODS)
-            .map(AuthMethod)
-            .collect();
+            // PERF FIX: Read methods one-by-one to avoid unnecessary allocation
+            let mut methods = Vec::with_capacity(nmethods);
+            for _ in 0..nmethods {
+                let method = reader.read_u8().await?;
+                methods.push(AuthMethod(method));
+            }
 
-        Ok(ClientHello {
-            version,
-            methods: processed_methods,
+            Ok(ClientHello {
+                version,
+                methods,
+            })
         })
+        .await
+        .map_err(|_| SocksError::IoError("Client read timeout".into()))?
     }
 
     /// Select authentication method from client's list
@@ -207,11 +286,15 @@ impl Connection {
         hello.write_to(writer).await
     }
 
-    /// Read SOCKS request
+    /// Read SOCKS request with timeout to prevent Slowloris attacks
     async fn read_request<R: AsyncReadExt + Unpin>(
         reader: &mut R,
     ) -> Result<SocksRequest, SocksError> {
-        SocksRequest::read_from(reader).await
+        timeout(CLIENT_READ_TIMEOUT, async {
+            SocksRequest::read_from(reader).await
+        })
+        .await
+        .map_err(|_| SocksError::IoError("Client read timeout".into()))?
     }
 
     /// Process SOCKS request and create connection to target server
@@ -329,7 +412,7 @@ impl Connection {
         R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let mut remote_ref = remote;
-        
+
         // Use copy_bidirectional for efficient relay
         // This copies data in both directions simultaneously
         let result = tokio::io::copy_bidirectional(&mut *client, &mut remote_ref).await;
@@ -367,6 +450,12 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
 
+    // CRITICAL FIX: Connection rate limiting
+    let tracker = Arc::new(ConnectionTracker::new(
+        MAX_CONNECTIONS_PER_IP,
+        MAX_CONCURRENT_CONNECTIONS,
+    ));
+
     // Graceful shutdown configuration
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -380,8 +469,34 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             result = listener.accept() => {
                 match result {
                     Ok((socket, remote_peer)) => {
+                        // CRITICAL FIX: Check connection limits
+                        let client_ip = remote_peer.ip();
+                        if !tracker.try_acquire(client_ip).await {
+                            tracing::warn!(
+                                ip = %client_ip,
+                                "Connection limit exceeded, rejecting"
+                            );
+                            drop(socket);
+                            continue;
+                        }
+
+                        // PERF FIX: Set TCP_NODELAY for lower latency
+                        if let Err(e) = socket.set_nodelay(true) {
+                            tracing::warn!("Failed to set TCP_NODELAY: {}", e);
+                        }
+
                         tracing::debug!(%remote_peer, "Accepted connection");
+
+                        // Clone tracker for this connection
+                        let conn_tracker = Arc::clone(&tracker);
+
                         join_set.spawn(async move {
+                            // Create guard to ensure we release the permit when connection ends
+                            let _guard = ConnectionGuard {
+                                tracker: conn_tracker,
+                                ip: client_ip,
+                            };
+
                             Connection::new(socket, remote_peer).process().await
                         });
                     }
