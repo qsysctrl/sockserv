@@ -88,6 +88,7 @@ pub enum SocksError {
     InvalidMessageFormat,
     InvalidReserved,
     DomainNameTooLong,
+    AuthenticationFailed,
     IoError(std::io::ErrorKind, String),
 }
 
@@ -112,6 +113,7 @@ impl std::fmt::Display for SocksError {
             SocksError::InvalidMessageFormat => write!(f, "invalid message format"),
             SocksError::InvalidReserved => write!(f, "invalid reserved byte"),
             SocksError::DomainNameTooLong => write!(f, "domain name too long (max 255)"),
+            SocksError::AuthenticationFailed => write!(f, "authentication failed"),
             SocksError::IoError(_, msg) => write!(f, "I/O error: {}", msg),
         }
     }
@@ -368,7 +370,6 @@ impl SocksAddress {
     const MAX_DOMAIN_LEN: usize = 255;
 
     /// Parse address from bytes
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parse(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.is_empty() {
             return Err(SocksError::BufferTooShort);
@@ -401,6 +402,7 @@ impl SocksAddress {
                 let domain = str::from_utf8(&buf[2..2 + domain_len])
                     .map_err(|_| SocksError::InvalidMessageFormat)?
                     .to_string();
+                validate_domain_name(&domain)?;
                 let port = u16::from_be_bytes([
                     buf[2 + domain_len],
                     buf[2 + domain_len + 1],
@@ -651,6 +653,213 @@ impl SocksResponse {
         writer.write_all(&bytes).await?;
         writer.flush().await?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// Username/Password Authentication (RFC 1929)
+// ============================================================================
+
+/// Auth subnegotiation version (RFC 1929)
+pub const AUTH_SUBNEG_VERSION: u8 = 0x01;
+
+/// Auth subnegotiation success status
+pub const AUTH_STATUS_SUCCESS: u8 = 0x00;
+
+/// Maximum username/password length per RFC 1929
+const MAX_AUTH_FIELD_LEN: usize = 255;
+
+/// Username/password authentication request (client → server, RFC 1929)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRequest {
+    pub version: u8,
+    pub username: String,
+    pub password: String,
+}
+
+impl AuthRequest {
+    /// Read auth request from async reader
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let version = reader.read_u8().await?;
+        if version != AUTH_SUBNEG_VERSION {
+            return Err(SocksError::InvalidVersion);
+        }
+
+        let ulen = reader.read_u8().await? as usize;
+        if ulen == 0 || ulen > MAX_AUTH_FIELD_LEN {
+            return Err(SocksError::InvalidMessageFormat);
+        }
+        let mut uname_buf = vec![0u8; ulen];
+        reader.read_exact(&mut uname_buf).await?;
+
+        let plen = reader.read_u8().await? as usize;
+        if plen == 0 || plen > MAX_AUTH_FIELD_LEN {
+            return Err(SocksError::InvalidMessageFormat);
+        }
+        let mut passwd_buf = vec![0u8; plen];
+        reader.read_exact(&mut passwd_buf).await?;
+
+        let username =
+            String::from_utf8(uname_buf).map_err(|_| SocksError::InvalidMessageFormat)?;
+        let password =
+            String::from_utf8(passwd_buf).map_err(|_| SocksError::InvalidMessageFormat)?;
+
+        Ok(Self {
+            version,
+            username,
+            password,
+        })
+    }
+
+    /// Serialize auth request to bytes
+    pub fn serialize(&self) -> Bytes {
+        let mut buf =
+            BytesMut::with_capacity(1 + 1 + self.username.len() + 1 + self.password.len());
+        buf.put_u8(AUTH_SUBNEG_VERSION);
+        buf.put_u8(self.username.len() as u8);
+        buf.put_slice(self.username.as_bytes());
+        buf.put_u8(self.password.len() as u8);
+        buf.put_slice(self.password.as_bytes());
+        buf.freeze()
+    }
+
+    /// Parse auth request from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn parse(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 5 {
+            return Err(SocksError::BufferTooShort);
+        }
+        let version = buf[0];
+        if version != AUTH_SUBNEG_VERSION {
+            return Err(SocksError::InvalidVersion);
+        }
+        let ulen = buf[1] as usize;
+        if ulen == 0 || buf.len() < 2 + ulen + 1 {
+            return Err(SocksError::BufferTooShort);
+        }
+        let username = str::from_utf8(&buf[2..2 + ulen])
+            .map_err(|_| SocksError::InvalidMessageFormat)?
+            .to_string();
+        let plen = buf[2 + ulen] as usize;
+        if plen == 0 || buf.len() < 2 + ulen + 1 + plen {
+            return Err(SocksError::BufferTooShort);
+        }
+        let password = str::from_utf8(&buf[3 + ulen..3 + ulen + plen])
+            .map_err(|_| SocksError::InvalidMessageFormat)?
+            .to_string();
+        Ok(Self {
+            version,
+            username,
+            password,
+        })
+    }
+}
+
+/// Username/password authentication response (server → client, RFC 1929)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthResponse {
+    pub version: u8,
+    pub status: u8,
+}
+
+impl AuthResponse {
+    pub fn success() -> Self {
+        Self {
+            version: AUTH_SUBNEG_VERSION,
+            status: AUTH_STATUS_SUCCESS,
+        }
+    }
+
+    pub fn failure() -> Self {
+        Self {
+            version: AUTH_SUBNEG_VERSION,
+            status: 0x01,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.status == AUTH_STATUS_SUCCESS
+    }
+
+    /// Write auth response to async writer
+    pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        let buf = [self.version, self.status];
+        writer.write_all(&buf).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    /// Parse auth response from bytes
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn parse(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 2 {
+            return Err(SocksError::BufferTooShort);
+        }
+        Ok(Self {
+            version: buf[0],
+            status: buf[1],
+        })
+    }
+
+    /// Serialize auth response to bytes
+    pub fn serialize(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8(self.version);
+        buf.put_u8(self.status);
+        buf.freeze()
+    }
+}
+
+// ============================================================================
+// UDP Relay Header (RFC 1928, Section 7)
+// ============================================================================
+
+/// UDP relay request/response header
+///
+/// ```text
+/// +----+------+------+----------+----------+----------+
+/// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+/// +----+------+------+----------+----------+----------+
+/// | 2  |  1   |  1   | Variable |    2     | Variable |
+/// +----+------+------+----------+----------+----------+
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpRelayHeader {
+    /// Fragment number (0 = standalone / no fragmentation)
+    pub frag: u8,
+    /// Destination address
+    pub address: SocksAddress,
+}
+
+impl UdpRelayHeader {
+    pub fn new(address: SocksAddress) -> Self {
+        Self { frag: 0, address }
+    }
+
+    /// Parse UDP relay header from a datagram buffer.
+    /// Returns (header, bytes_consumed) so the caller knows where the payload starts.
+    pub fn parse(buf: &[u8]) -> Result<(Self, usize)> {
+        // Minimum: RSV(2) + FRAG(1) + ATYP(1) + smallest addr (IPv4: 4+2)
+        if buf.len() < 10 {
+            return Err(SocksError::BufferTooShort);
+        }
+        if buf[0] != 0x00 || buf[1] != 0x00 {
+            return Err(SocksError::InvalidReserved);
+        }
+        let frag = buf[2];
+        let (address, addr_len) = SocksAddress::parse(&buf[3..])?;
+        Ok((Self { frag, address }, 3 + addr_len))
+    }
+
+    /// Serialize the header (without payload) to bytes.
+    pub fn serialize(&self) -> Bytes {
+        let addr_bytes = self.address.serialize();
+        let mut buf = BytesMut::with_capacity(3 + addr_bytes.len());
+        buf.put_u8(0x00); // RSV
+        buf.put_u8(0x00); // RSV
+        buf.put_u8(self.frag);
+        buf.put_slice(&addr_bytes);
+        buf.freeze()
     }
 }
 
@@ -1295,7 +1504,7 @@ mod tests {
 
             #[test]
             fn prop_domain_roundtrip(
-                domain in prop::string::string_regex("[a-zA-Z0-9.-]{1,100}").unwrap(),
+                domain in prop::string::string_regex("[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}").unwrap(),
                 port in any::<u16>()
             ) {
                 let addr = SocksAddress::Domain(domain, port);

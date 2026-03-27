@@ -36,14 +36,17 @@ A high-performance, reliable SOCKS5 proxy server implementation in Rust, built w
 - ✅ DNS resolution for domain names
 - ✅ 10-second connection timeout (DoS protection)
 - ✅ Bidirectional data relay
+- ✅ Username/Password authentication (RFC 1929)
+- ✅ BIND command support (RFC 1928)
+- ✅ UDP ASSOCIATE support (RFC 1928)
 
 ## Roadmap (TODO)
 
 ### High Priority
 
-- [ ] **BIND command support** - RFC 1928 section 4.6.2
-- [ ] **UDP ASSOCIATE support** - RFC 1928 section 4.6.3
-- [ ] **Username/Password authentication** - RFC 1929
+- [x] **BIND command support** - RFC 1928 section 4.6.2 ✅
+- [x] **UDP ASSOCIATE support** - RFC 1928 section 4.6.3 ✅
+- [x] **Username/Password authentication** - RFC 1929 ✅
 
 ### Medium Priority
 

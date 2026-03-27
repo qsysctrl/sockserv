@@ -533,20 +533,20 @@ async fn test_invalid_version() {
     let _ = server_handle.await;
 }
 
-/// Test unsupported command (BIND)
+/// Test BIND command: open listener, accept connection, relay data
 #[tokio::test]
-async fn test_unsupported_command_bind() {
+async fn test_bind_command() {
     let _ = tracing_subscriber::fmt().try_init();
 
-    let port = find_available_port().await;
-    let (server_handle, server_ready) = start_test_server(port).await;
+    let socks_port = find_available_port().await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
     wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
         .expect("Server failed to start");
 
     let mut stream = tokio::time::timeout(
         TEST_OPERATION_TIMEOUT,
-        TcpStream::connect(format!("127.0.0.1:{}", port))
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port)),
     )
     .await
     .expect("Connection timeout")
@@ -557,53 +557,320 @@ async fn test_unsupported_command_bind() {
     let (_version, method) = read_server_hello(&mut stream).await.unwrap();
     assert_eq!(method, 0x00);
 
-    // Send BIND request
+    // Send BIND request (DST.ADDR = 0.0.0.0:0)
     let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
     let mut buf = vec![0x05, 0x02, 0x00]; // CMD_BIND
     buf.extend_from_slice(&addr_bytes);
     stream.write_all(&buf).await.unwrap();
 
-    // Read response
-    let response = read_full_response(&mut stream).await.unwrap();
-    assert_eq!(response[1], 0x07); // Command not supported
+    // Read first response — should be Success with a bound address
+    let first_resp = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(first_resp[0], 0x05);
+    assert_eq!(first_resp[1], 0x00); // Success
+    assert_eq!(first_resp[3], 0x01); // IPv4
+
+    // Extract bound port from the response
+    let bind_port = u16::from_be_bytes([first_resp[8], first_resp[9]]);
+    assert_ne!(bind_port, 0, "Bound port should not be 0");
+
+    // Connect to the bound port from a separate task
+    let connector = tokio::spawn(async move {
+        let mut remote =
+            TcpStream::connect(format!("127.0.0.1:{}", bind_port))
+                .await
+                .expect("Failed to connect to BIND port");
+        // Send test data through the relay
+        remote.write_all(b"BIND_DATA").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), remote.read(&mut buf))
+            .await
+            .expect("Read timeout")
+            .expect("Read error");
+        buf.truncate(n);
+        buf
+    });
+
+    // Read second response — should be Success with the connecting peer's address
+    let second_resp = read_full_response(&mut stream).await.unwrap();
+    assert_eq!(second_resp[0], 0x05);
+    assert_eq!(second_resp[1], 0x00); // Success
+
+    // Now we're in relay mode — read the data sent by the connector
+    let mut data_buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut data_buf))
+        .await
+        .expect("Read timeout")
+        .expect("Read error");
+    assert_eq!(&data_buf[..n], b"BIND_DATA");
+
+    // Echo data back through the relay
+    stream.write_all(b"BIND_REPLY").await.unwrap();
+
+    let remote_received = connector.await.unwrap();
+    assert_eq!(&remote_received, b"BIND_REPLY");
 
     server_handle.abort();
     let _ = server_handle.await;
 }
 
-/// Test unsupported command (UDP ASSOCIATE)
+/// Test UDP ASSOCIATE command: relay UDP datagrams
 #[tokio::test]
-async fn test_unsupported_command_udp() {
+async fn test_udp_associate() {
     let _ = tracing_subscriber::fmt().try_init();
 
-    let port = find_available_port().await;
-    let (server_handle, server_ready) = start_test_server(port).await;
+    // Start a mock UDP echo server
+    let echo_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_socket.local_addr().unwrap();
+    let echo_handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        if let Ok((n, src)) = echo_socket.recv_from(&mut buf).await {
+            let _ = echo_socket.send_to(&buf[..n], src).await;
+        }
+    });
+
+    // Start SOCKS server
+    let socks_port = find_available_port().await;
+    let (server_handle, server_ready) = start_test_server(socks_port).await;
     wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
         .await
         .expect("Server failed to start");
 
-    let mut stream = tokio::time::timeout(
+    // TCP control connection
+    let mut tcp_stream = tokio::time::timeout(
         TEST_OPERATION_TIMEOUT,
-        TcpStream::connect(format!("127.0.0.1:{}", port))
+        TcpStream::connect(format!("127.0.0.1:{}", socks_port)),
     )
     .await
     .expect("Connection timeout")
     .unwrap();
 
     // Handshake
-    send_client_hello(&mut stream, &[0x00]).await.unwrap();
-    let (_version, method) = read_server_hello(&mut stream).await.unwrap();
+    send_client_hello(&mut tcp_stream, &[0x00]).await.unwrap();
+    let (_ver, method) = read_server_hello(&mut tcp_stream).await.unwrap();
     assert_eq!(method, 0x00);
 
-    // Send UDP ASSOCIATE request
+    // Send UDP ASSOCIATE request (DST.ADDR = 0.0.0.0:0)
     let addr_bytes = [0x01, 0, 0, 0, 0, 0, 0];
     let mut buf = vec![0x05, 0x03, 0x00]; // CMD_UDP_ASSOCIATE
     buf.extend_from_slice(&addr_bytes);
-    stream.write_all(&buf).await.unwrap();
+    tcp_stream.write_all(&buf).await.unwrap();
 
-    // Read response
+    // Read response — should contain the UDP relay address
+    let response = read_full_response(&mut tcp_stream).await.unwrap();
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00); // Success
+    assert_eq!(response[3], 0x01); // IPv4
+
+    let relay_port = u16::from_be_bytes([response[8], response[9]]);
+    assert_ne!(relay_port, 0);
+    let relay_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", relay_port).parse().unwrap();
+
+    // Open a UDP socket to talk to the relay
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Build a UDP relay datagram: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT + DATA
+    // Target: the echo server
+    let echo_port_bytes = (echo_addr.port()).to_be_bytes();
+    let mut dgram = vec![
+        0x00, 0x00, // RSV
+        0x00,       // FRAG = 0 (no fragmentation)
+        0x01,       // ATYP = IPv4
+        127, 0, 0, 1,
+        echo_port_bytes[0], echo_port_bytes[1],
+    ];
+    dgram.extend_from_slice(b"HELLO_UDP");
+
+    // Send through the relay
+    client_udp.send_to(&dgram, relay_addr).await.unwrap();
+
+    // Receive the response through the relay
+    let mut recv_buf = vec![0u8; 65535];
+    let (n, _src) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client_udp.recv_from(&mut recv_buf),
+    )
+    .await
+    .expect("UDP relay response timeout")
+    .expect("UDP recv error");
+
+    // Parse the relay header from the response
+    // RSV(2) + FRAG(1) + ATYP(1) + IPv4(4) + PORT(2) = 10 bytes header
+    assert!(n >= 10, "Response too short: {} bytes", n);
+    assert_eq!(recv_buf[0], 0x00); // RSV
+    assert_eq!(recv_buf[1], 0x00); // RSV
+    assert_eq!(recv_buf[2], 0x00); // FRAG
+    assert_eq!(recv_buf[3], 0x01); // ATYP IPv4
+    let payload = &recv_buf[10..n];
+    assert_eq!(payload, b"HELLO_UDP");
+
+    // Close TCP control connection → should terminate the UDP relay
+    drop(tcp_stream);
+
+    echo_handle.abort();
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+// ============================================================================
+// Username/Password Authentication Tests
+// ============================================================================
+
+/// Helper: start a test server with username/password authentication
+async fn start_auth_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
+
+    let handle = tokio::spawn(async move {
+        ready_clone.notify_one();
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("testuser".to_string(), "testpass".to_string());
+        let config = ServerConfig {
+            allow_private_destinations: true,
+            credentials: Some(credentials),
+            ..ServerConfig::default()
+        };
+        let _ = server::run_with_config(port, config).await;
+    });
+
+    (handle, ready)
+}
+
+/// Helper: send RFC 1929 username/password auth request
+async fn send_auth_request(
+    stream: &mut TcpStream,
+    username: &str,
+    password: &str,
+) -> std::io::Result<()> {
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x01); // subneg version
+    buf.put_u8(username.len() as u8);
+    buf.put_slice(username.as_bytes());
+    buf.put_u8(password.len() as u8);
+    buf.put_slice(password.as_bytes());
+    stream.write_all(&buf).await
+}
+
+/// Helper: read RFC 1929 auth response
+async fn read_auth_response(stream: &mut TcpStream) -> std::io::Result<(u8, u8)> {
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await?;
+    Ok((buf[0], buf[1]))
+}
+
+/// Test: successful authentication + CONNECT
+#[tokio::test]
+async fn test_auth_success() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let (server_handle, server_ready) = start_auth_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
+        .await
+        .expect("Server failed to start");
+
+    let (target_port, target_handle) = start_mock_target_server().await;
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
+
+    // Client hello — offer USERNAME_PASSWORD (0x02)
+    send_client_hello(&mut stream, &[0x02]).await.unwrap();
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0x02); // USERNAME_PASSWORD selected
+
+    // Auth subnegotiation
+    send_auth_request(&mut stream, "testuser", "testpass").await.unwrap();
+    let (auth_ver, auth_status) = read_auth_response(&mut stream).await.unwrap();
+    assert_eq!(auth_ver, 0x01);
+    assert_eq!(auth_status, 0x00); // Success
+
+    // CONNECT to target
+    let addr_bytes = [
+        0x01,
+        127, 0, 0, 1,
+        (target_port >> 8) as u8,
+        (target_port & 0xFF) as u8,
+    ];
+    send_connect_request(&mut stream, &addr_bytes).await.unwrap();
+
     let response = read_full_response(&mut stream).await.unwrap();
-    assert_eq!(response[1], 0x07); // Command not supported
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00); // Success
+
+    server_handle.abort();
+    target_handle.abort();
+    let _ = server_handle.await;
+}
+
+/// Test: server rejects NO_AUTH when credentials are configured
+#[tokio::test]
+async fn test_auth_reject_no_auth() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let (server_handle, server_ready) = start_auth_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
+        .await
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
+
+    // Client hello — offer only NO_AUTH (0x00)
+    send_client_hello(&mut stream, &[0x00]).await.unwrap();
+    let (version, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(version, 0x05);
+    assert_eq!(method, 0xFF); // NO_ACCEPTABLE — must authenticate
+
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+/// Test: wrong password — auth failure
+#[tokio::test]
+async fn test_auth_wrong_password() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let port = find_available_port().await;
+    let (server_handle, server_ready) = start_auth_test_server(port).await;
+    wait_for_server_ready(&server_ready, SERVER_STARTUP_TIMEOUT)
+        .await
+        .expect("Server failed to start");
+
+    let mut stream = tokio::time::timeout(
+        TEST_OPERATION_TIMEOUT,
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
+    )
+    .await
+    .expect("Connection timeout")
+    .unwrap();
+
+    send_client_hello(&mut stream, &[0x02]).await.unwrap();
+    let (_ver, method) = read_server_hello(&mut stream).await.unwrap();
+    assert_eq!(method, 0x02);
+
+    // Wrong password
+    send_auth_request(&mut stream, "testuser", "wrongpass").await.unwrap();
+    let (auth_ver, auth_status) = read_auth_response(&mut stream).await.unwrap();
+    assert_eq!(auth_ver, 0x01);
+    assert_ne!(auth_status, 0x00); // Failure
+
+    // Server should close the connection
+    let mut buf = [0u8; 1];
+    let result = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await;
+    assert!(result.is_err() || result.unwrap().map(|n| n == 0).unwrap_or(true));
 
     server_handle.abort();
     let _ = server_handle.await;
