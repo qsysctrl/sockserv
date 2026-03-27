@@ -88,7 +88,7 @@ pub enum SocksError {
     InvalidMessageFormat,
     InvalidReserved,
     DomainNameTooLong,
-    IoError(String),
+    IoError(std::io::ErrorKind, String),
 }
 
 impl std::fmt::Display for SocksError {
@@ -112,7 +112,7 @@ impl std::fmt::Display for SocksError {
             SocksError::InvalidMessageFormat => write!(f, "invalid message format"),
             SocksError::InvalidReserved => write!(f, "invalid reserved byte"),
             SocksError::DomainNameTooLong => write!(f, "domain name too long (max 255)"),
-            SocksError::IoError(msg) => write!(f, "I/O error: {}", msg),
+            SocksError::IoError(_, msg) => write!(f, "I/O error: {}", msg),
         }
     }
 }
@@ -121,7 +121,7 @@ impl std::error::Error for SocksError {}
 
 impl From<std::io::Error> for SocksError {
     fn from(err: std::io::Error) -> Self {
-        SocksError::IoError(err.to_string())
+        SocksError::IoError(err.kind(), err.to_string())
     }
 }
 
@@ -344,8 +344,8 @@ impl ServerHello {
 
     /// Write server hello to async writer
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        writer.write_u8(self.version).await?;
-        writer.write_u8(self.method.0).await?;
+        let bytes = self.serialize();
+        writer.write_all(&bytes).await?;
         writer.flush().await?;
         Ok(())
     }
@@ -641,35 +641,14 @@ impl SocksResponse {
 
     /// Write response to async writer
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        writer.write_u8(self.version).await?;
-        // Use TryFrom for safe reply code conversion
-        writer.write_u8(self.reply as u8).await?;
-        writer.write_u8(RSV).await?;
-
-        match &self.address {
-            SocksAddress::Ipv4(ip, port) => {
-                writer.write_u8(ATYP_IPV4).await?;
-                writer.write_all(&ip.octets()).await?;
-                writer.write_u16(*port).await?;
-            }
-            SocksAddress::Domain(domain, port) => {
-                writer.write_u8(ATYP_DOMAIN).await?;
-                // Safe length conversion with explicit check to prevent truncation
-                let domain_len = domain.len();
-                if domain_len > SocksAddress::MAX_DOMAIN_LEN {
-                    return Err(SocksError::DomainNameTooLong);
-                }
-                writer.write_u8(domain_len as u8).await?;
-                writer.write_all(domain.as_bytes()).await?;
-                writer.write_u16(*port).await?;
-            }
-            SocksAddress::Ipv6(ip, port) => {
-                writer.write_u8(ATYP_IPV6).await?;
-                writer.write_all(&ip.octets()).await?;
-                writer.write_u16(*port).await?;
+        // Validate domain length before serialization to prevent silent truncation
+        if let SocksAddress::Domain(ref domain, _) = self.address {
+            if domain.len() > SocksAddress::MAX_DOMAIN_LEN {
+                return Err(SocksError::DomainNameTooLong);
             }
         }
-
+        let bytes = self.serialize();
+        writer.write_all(&bytes).await?;
         writer.flush().await?;
         Ok(())
     }

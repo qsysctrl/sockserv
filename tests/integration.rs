@@ -4,7 +4,7 @@
 //! by spawning a real server using `server::run_on_port()` and connecting to it as a client.
 
 use bytes::{BufMut, BytesMut};
-use sockserv::server;
+use sockserv::server::{self, ServerConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,18 +83,23 @@ async fn read_full_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> 
     Ok(full_response)
 }
 
-/// Start a test server on the given port and return a handle to the server task
-/// Uses a ready signal to avoid race conditions
+/// Start a test server on the given port and return a handle to the server task.
+/// Uses a ready signal to avoid race conditions.
+/// Tests use `allow_private_destinations: true` so that connections to
+/// localhost/loopback targets succeed (SSRF protection is off for tests).
 async fn start_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
     let ready = Arc::new(Notify::new());
     let ready_clone = ready.clone();
-    
+
     let handle = tokio::spawn(async move {
-        // Signal that server is about to start
         ready_clone.notify_one();
-        let _ = server::run_on_port(port).await;
+        let config = ServerConfig {
+            allow_private_destinations: true,
+            ..ServerConfig::default()
+        };
+        let _ = server::run_with_config(port, config).await;
     });
-    
+
     (handle, ready)
 }
 
@@ -431,7 +436,8 @@ async fn test_connect_ipv6() {
     let response = read_full_response(&mut stream).await.unwrap();
     assert_eq!(response[0], 0x05);
     assert_eq!(response[1], 0x00); // Success
-    assert_eq!(response[3], 0x04); // IPv6
+    // Bind address is always IPv4 unspecified (0.0.0.0:0) to prevent IP leak
+    assert_eq!(response[3], 0x01); // IPv4
 
     server_handle.abort();
     target_handle.abort();

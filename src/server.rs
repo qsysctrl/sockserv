@@ -5,34 +5,107 @@ use protocol::{
     SocksRequest, SocksResponse, SOCKS_VERSION,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 
-/// Maximum number of authentication methods we accept
-const MAX_AUTH_METHODS: usize = 128;
+// ============================================================================
+// Configuration
+// ============================================================================
 
-/// Timeout for reading from client (prevents Slowloris attacks)
-const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Server configuration with sensible defaults
+pub struct ServerConfig {
+    /// Maximum number of authentication methods accepted from a client
+    pub max_auth_methods: usize,
+    /// Timeout for reading from client (prevents Slowloris attacks)
+    pub client_read_timeout: Duration,
+    /// Timeout for connecting to remote servers
+    pub connect_timeout: Duration,
+    /// Timeout for DNS resolution
+    pub dns_timeout: Duration,
+    /// Total connection timeout
+    pub connection_timeout: Duration,
+    /// Maximum concurrent connections
+    pub max_concurrent_connections: usize,
+    /// Maximum connections per IP address
+    pub max_connections_per_ip: usize,
+    /// Allow connections to private/reserved IP ranges (DANGEROUS — enables SSRF)
+    pub allow_private_destinations: bool,
+    /// Timeout for graceful shutdown
+    pub shutdown_timeout: Duration,
+}
 
-/// Timeout for connecting to remote servers (prevents hanging on slow/unreachable hosts)
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_auth_methods: 128,
+            client_read_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
+            dns_timeout: Duration::from_secs(5),
+            connection_timeout: Duration::from_secs(120),
+            max_concurrent_connections: 10_000,
+            max_connections_per_ip: 100,
+            allow_private_destinations: false,
+            shutdown_timeout: Duration::from_secs(30),
+        }
+    }
+}
 
-/// Total connection timeout (prevents hanging connections)
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+// ============================================================================
+// Address validation (SSRF protection)
+// ============================================================================
 
-/// Maximum concurrent connections (prevents DoS)
-const MAX_CONCURRENT_CONNECTIONS: usize = 10_000;
+/// Check if an IP address is in a private, reserved, or otherwise non-public range.
+///
+/// Used to prevent SSRF attacks where a client requests the proxy to connect
+/// to internal network resources (localhost, cloud metadata endpoints, etc.).
+fn is_private_or_reserved(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_or_reserved_v4(v4),
+        IpAddr::V6(v6) => is_private_or_reserved_v6(v6),
+    }
+}
 
-/// Maximum connections per IP address (prevents single-IP DoS)
-const MAX_CONNECTIONS_PER_IP: usize = 100;
+fn is_private_or_reserved_v4(v4: &Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()                                        // 127.0.0.0/8
+        || v4.is_private()                                  // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local()                               // 169.254.0.0/16
+        || v4.is_broadcast()                                // 255.255.255.255
+        || v4.is_unspecified()                              // 0.0.0.0
+        || v4.is_documentation()                            // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || (octets[0] == 100 && (octets[1] & 0xC0) == 64)  // Shared/CGNAT 100.64.0.0/10
+        || (octets[0] == 198 && (octets[1] & 0xFE) == 18)  // Benchmarking 198.18.0.0/15
+        || octets[0] >= 240                                 // Reserved 240.0.0.0/4 + broadcast
+        || (octets[0] == 0)                                 // "This network" 0.0.0.0/8
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocol 192.0.0.0/24
+}
 
-/// Tracks active connections for rate limiting
+fn is_private_or_reserved_v6(v6: &Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    v6.is_loopback()                            // ::1
+        || v6.is_unspecified()                  // ::
+        || (seg[0] & 0xfe00) == 0xfc00         // Unique local fc00::/7
+        || (seg[0] & 0xffc0) == 0xfe80         // Link-local fe80::/10
+        || v6.to_ipv4_mapped()                  // IPv4-mapped ::ffff:x.x.x.x
+            .is_some_and(|v4| is_private_or_reserved_v4(&v4))
+}
+
+// ============================================================================
+// Connection tracking and rate limiting
+// ============================================================================
+
+/// Tracks active connections for rate limiting.
+///
+/// Uses `std::sync::Mutex` (not tokio) for the per-IP map because the lock
+/// is held for nanoseconds (just an integer increment/decrement). This also
+/// allows synchronous release in `Drop`, eliminating the need for
+/// `tokio::spawn` during cleanup.
 struct ConnectionTracker {
-    ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip_counts: StdMutex<HashMap<IpAddr, usize>>,
     max_per_ip: usize,
     semaphore: Arc<Semaphore>,
 }
@@ -40,33 +113,36 @@ struct ConnectionTracker {
 impl ConnectionTracker {
     fn new(max_per_ip: usize, max_total: usize) -> Self {
         Self {
-            ip_counts: Arc::new(Mutex::new(HashMap::new())),
+            ip_counts: StdMutex::new(HashMap::new()),
             max_per_ip,
             semaphore: Arc::new(Semaphore::new(max_total)),
         }
     }
 
-    /// Try to acquire a permit for a new connection from the given IP
-    /// Returns true if the connection is allowed, false if limits are exceeded
-    async fn try_acquire(&self, ip: IpAddr) -> bool {
-        // Check total connection limit first (fast path)
-        if self.semaphore.available_permits() == 0 {
-            return false;
-        }
+    /// Try to acquire a permit for a new connection from the given IP.
+    ///
+    /// Acquires the semaphore permit atomically first (total limit),
+    /// then checks the per-IP limit under a std mutex. This eliminates
+    /// the TOCTOU race from the previous implementation.
+    fn try_acquire(&self, ip: IpAddr) -> Option<ConnectionPermit> {
+        // Acquire semaphore permit (atomic, no race condition)
+        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
 
-        // Check and update per-IP limit
-        let mut counts = self.ip_counts.lock().await;
+        // Check and increment per-IP count
+        let mut counts = self.ip_counts.lock().unwrap_or_else(|e| e.into_inner());
         let count = counts.entry(ip).or_insert(0);
         if *count >= self.max_per_ip {
-            return false;
+            // permit is dropped here, automatically releasing the semaphore slot
+            return None;
         }
         *count += 1;
-        true
+
+        Some(ConnectionPermit { _permit: permit })
     }
 
-    /// Release a permit when a connection closes
-    async fn release(&self, ip: IpAddr) {
-        let mut counts = self.ip_counts.lock().await;
+    /// Release the per-IP counter. Called synchronously from `ConnectionGuard::drop`.
+    fn release_ip(&self, ip: IpAddr) {
+        let mut counts = self.ip_counts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = counts.get_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -76,30 +152,31 @@ impl ConnectionTracker {
     }
 }
 
-/// RAII guard to ensure connection tracker is updated when connection closes
+/// Holds the semaphore permit. Dropped automatically when the guard is dropped.
+struct ConnectionPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// RAII guard — releases per-IP count synchronously and semaphore permit
+/// via `Drop` of the inner `ConnectionPermit`. No `tokio::spawn` needed.
 struct ConnectionGuard {
     tracker: Arc<ConnectionTracker>,
     ip: IpAddr,
+    _permit: ConnectionPermit,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        // Clone the data we need for the async release
-        let tracker = Arc::clone(&self.tracker);
-        let ip = self.ip;
-
-        // Spawn a task to release the permit (non-blocking)
-        // Since Drop is synchronous, we spawn an async task
-        tokio::spawn(async move {
-            tracker.release(ip).await;
-        });
+        self.tracker.release_ip(self.ip);
+        // _permit is dropped here → OwnedSemaphorePermit released
     }
 }
 
-/// Map TCP connection errors to SOCKS reply codes
-///
-/// This function analyzes the underlying IO error kind and maps it to the
-/// appropriate SOCKS5 reply code according to RFC 1928 semantics.
+// ============================================================================
+// Error mapping
+// ============================================================================
+
+/// Map TCP connection errors to SOCKS reply codes per RFC 1928.
 fn map_connect_error(err: std::io::Error) -> SocksError {
     use std::io::ErrorKind;
 
@@ -109,42 +186,105 @@ fn map_connect_error(err: std::io::Error) -> SocksError {
         ErrorKind::HostUnreachable => SocksError::HostUnreachable,
         ErrorKind::TimedOut => SocksError::TtlExpired,
         ErrorKind::PermissionDenied => SocksError::ConnectionNotAllowed,
-        // For other errors, use invalid request as general failure
         _ => SocksError::InvalidRequest,
     }
 }
 
-/// Resolve a SocksAddress to a SocketAddr
-///
-/// For IPv4 and IPv6 addresses, returns the address directly.
-/// For domain names, performs DNS lookup and returns the first resolved address.
-async fn resolve_address(address: &SocksAddress) -> Result<SocketAddr, SocksError> {
-    match address {
-        SocksAddress::Ipv4(ip, port) => Ok(SocketAddr::new(IpAddr::V4(*ip), *port)),
-        SocksAddress::Ipv6(ip, port) => Ok(SocketAddr::new(IpAddr::V6(*ip), *port)),
-        SocksAddress::Domain(domain, port) => {
-            // DNS lookup using tokio's async resolver
-            let mut addrs = tokio::net::lookup_host((domain.as_str(), *port))
-                .await
-                .map_err(|_| SocksError::HostUnreachable)?;
+// ============================================================================
+// Address resolution
+// ============================================================================
 
-            // Return the first resolved address
-            addrs.next().ok_or(SocksError::HostUnreachable)
+/// Resolve a `SocksAddress` to a `SocketAddr` with SSRF protection.
+///
+/// For domain names, performs DNS lookup with a configurable timeout.
+/// After resolution, all addresses are checked against private/reserved
+/// ranges (unless `allow_private_destinations` is set).
+async fn resolve_address(
+    address: &SocksAddress,
+    config: &ServerConfig,
+) -> Result<SocketAddr, SocksError> {
+    match address {
+        SocksAddress::Ipv4(ip, port) => {
+            let addr = SocketAddr::new(IpAddr::V4(*ip), *port);
+            if !config.allow_private_destinations && is_private_or_reserved(&addr.ip()) {
+                return Err(SocksError::ConnectionNotAllowed);
+            }
+            Ok(addr)
+        }
+        SocksAddress::Ipv6(ip, port) => {
+            let addr = SocketAddr::new(IpAddr::V6(*ip), *port);
+            if !config.allow_private_destinations && is_private_or_reserved(&addr.ip()) {
+                return Err(SocksError::ConnectionNotAllowed);
+            }
+            Ok(addr)
+        }
+        SocksAddress::Domain(domain, port) => {
+            // DNS lookup with timeout to prevent hanging on slow resolvers
+            let addrs = timeout(
+                config.dns_timeout,
+                tokio::net::lookup_host((domain.as_str(), *port)),
+            )
+            .await
+            .map_err(|_| SocksError::TtlExpired)?
+            .map_err(|_| SocksError::HostUnreachable)?;
+
+            // Find the first address that passes the private-range check
+            for addr in addrs {
+                if config.allow_private_destinations || !is_private_or_reserved(&addr.ip()) {
+                    return Ok(addr);
+                }
+            }
+            // All resolved addresses were private/reserved
+            Err(SocksError::ConnectionNotAllowed)
         }
     }
 }
+
+// ============================================================================
+// Shutdown signal
+// ============================================================================
+
+/// Wait for a shutdown signal (SIGINT on all platforms, SIGTERM on Unix).
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received SIGINT, initiating graceful shutdown...");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to register Ctrl+C handler");
+    tracing::info!("Received SIGINT, initiating graceful shutdown...");
+}
+
+// ============================================================================
+// Connection handler
+// ============================================================================
 
 /// SOCKS5 server connection handler
 struct Connection {
     socket: TcpStream,
     remote_peer: SocketAddr,
+    config: Arc<ServerConfig>,
 }
 
 impl Connection {
-    fn new(socket: TcpStream, remote_peer: SocketAddr) -> Self {
+    fn new(socket: TcpStream, remote_peer: SocketAddr, config: Arc<ServerConfig>) -> Self {
         Self {
             socket,
             remote_peer,
+            config,
         }
     }
 
@@ -153,25 +293,24 @@ impl Connection {
         name = "Connection::process",
         level = "debug",
         skip(self),
-        fields(
-            remote_peer = %self.remote_peer.ip(),
-        ),
+        fields(remote_peer = %self.remote_peer.ip()),
     )]
     async fn process(self) -> Result<(), SocksError> {
-        tokio::time::timeout(CONNECTION_TIMEOUT, async {
+        let config = Arc::clone(&self.config);
+
+        tokio::time::timeout(config.connection_timeout, async {
             tracing::debug!("Session start");
 
-            // Perform handshake
             let (mut read_half, mut write_half) = self.socket.into_split();
 
             // Step 1: Read client hello
-            let client_hello = Self::read_client_hello(&mut read_half).await?;
+            let client_hello = Self::read_client_hello(&mut read_half, &config).await?;
             tracing::debug!(
                 methods = ?client_hello.methods.iter().map(|m| m.0).collect::<Vec<_>>(),
                 "Received client hello"
             );
 
-            // Step 2: Select authentication method (we only support NO_AUTH)
+            // Step 2: Select authentication method (NO_AUTH only)
             let selected_method = Self::select_auth_method(&client_hello);
             tracing::debug!(method = selected_method.0, "Selected auth method");
 
@@ -185,7 +324,7 @@ impl Connection {
             }
 
             // Step 4: Read SOCKS request
-            let request = Self::read_request(&mut read_half).await?;
+            let request = Self::read_request(&mut read_half, &config).await?;
             tracing::debug!(
                 command = request.command as u8,
                 address = ?request.address,
@@ -193,28 +332,25 @@ impl Connection {
             );
 
             // Step 5: Process request and establish connection to target
-            let result = Self::process_request(&request, &self.remote_peer).await;
+            let result = Self::process_request(&request, &config).await;
 
             match result {
                 Ok((response, Some(remote_stream))) => {
-                    // Successful connection - send response and start relay
                     tracing::debug!(reply = response.reply as u8, "Sending SOCKS response");
                     Self::send_response(&mut write_half, &response).await?;
 
                     tracing::debug!("Starting data relay");
-                    // Recombine the client socket halves for bidirectional relay
-                    let mut client_stream = read_half.reunite(write_half)
+                    let mut client_stream = read_half
+                        .reunite(write_half)
                         .map_err(|_| SocksError::InvalidRequest)?;
 
                     Self::relay_data(&mut client_stream, remote_stream).await;
                 }
                 Ok((response, None)) => {
-                    // Failed connection - send error response and close
                     tracing::debug!(reply = response.reply as u8, "Sending error response");
                     Self::send_response(&mut write_half, &response).await?;
                 }
                 Err(e) => {
-                    // Error during request processing
                     let reply_code = match &e {
                         SocksError::ConnectionRefused => ReplyCode::ConnectionRefused,
                         SocksError::NetworkUnreachable => ReplyCode::NetworkUnreachable,
@@ -223,7 +359,8 @@ impl Connection {
                         SocksError::ConnectionNotAllowed => ReplyCode::ConnectionNotAllowed,
                         _ => ReplyCode::GeneralFailure,
                     };
-                    let response = SocksResponse::new(reply_code, Self::get_unspec_address());
+                    let response =
+                        SocksResponse::new(reply_code, Self::get_unspec_address());
                     tracing::debug!(reply = response.reply as u8, "Sending error response");
                     Self::send_response(&mut write_half, &response).await?;
                 }
@@ -233,51 +370,54 @@ impl Connection {
             Ok(())
         })
         .await
-        .map_err(|_| SocksError::IoError("Connection timeout".into()))?
+        .map_err(|_| {
+            SocksError::IoError(std::io::ErrorKind::TimedOut, "Connection timeout".into())
+        })?
     }
 
-    /// Read client hello message with timeout to prevent Slowloris attacks
+    /// Read client hello message with timeout.
     async fn read_client_hello<R: AsyncReadExt + Unpin>(
         reader: &mut R,
+        config: &ServerConfig,
     ) -> Result<ClientHello, SocksError> {
-        timeout(CLIENT_READ_TIMEOUT, async {
-            // Read version byte
+        timeout(config.client_read_timeout, async {
             let version = reader.read_u8().await?;
             if version != SOCKS_VERSION {
                 return Err(SocksError::InvalidVersion);
             }
 
-            // Read number of methods
             let nmethods = reader.read_u8().await? as usize;
             if nmethods == 0 {
                 return Err(SocksError::NoAuthMethods);
             }
-
-            // CRITICAL FIX: Validate BEFORE allocation to prevent DoS
-            if nmethods > MAX_AUTH_METHODS {
+            if nmethods > config.max_auth_methods {
                 return Err(SocksError::InvalidRequest);
             }
 
-            // PERF FIX: Read methods one-by-one to avoid unnecessary allocation
             let mut methods = Vec::with_capacity(nmethods);
             for _ in 0..nmethods {
                 let method = reader.read_u8().await?;
                 methods.push(AuthMethod(method));
             }
 
-            Ok(ClientHello {
-                version,
-                methods,
-            })
+            Ok(ClientHello { version, methods })
         })
         .await
-        .map_err(|_| SocksError::IoError("Client read timeout".into()))?
+        .map_err(|_| {
+            SocksError::IoError(
+                std::io::ErrorKind::TimedOut,
+                "Client read timeout".into(),
+            )
+        })?
     }
 
     /// Select authentication method from client's list
     fn select_auth_method(client_hello: &ClientHello) -> AuthMethod {
-        // We only support NO_AUTH (0x00)
-        if client_hello.methods.iter().any(|m| m.0 == AuthMethod::NO_AUTH.0) {
+        if client_hello
+            .methods
+            .iter()
+            .any(|m| m.0 == AuthMethod::NO_AUTH.0)
+        {
             AuthMethod::NO_AUTH
         } else {
             AuthMethod::NO_ACCEPTABLE
@@ -293,115 +433,89 @@ impl Connection {
         hello.write_to(writer).await
     }
 
-    /// Read SOCKS request with timeout to prevent Slowloris attacks
+    /// Read SOCKS request with timeout.
     async fn read_request<R: AsyncReadExt + Unpin>(
         reader: &mut R,
+        config: &ServerConfig,
     ) -> Result<SocksRequest, SocksError> {
-        timeout(CLIENT_READ_TIMEOUT, async {
-            SocksRequest::read_from(reader).await
-        })
-        .await
-        .map_err(|_| SocksError::IoError("Client read timeout".into()))?
+        timeout(config.client_read_timeout, SocksRequest::read_from(reader))
+            .await
+            .map_err(|_| {
+                SocksError::IoError(
+                    std::io::ErrorKind::TimedOut,
+                    "Client read timeout".into(),
+                )
+            })?
     }
 
-    /// Process SOCKS request and create connection to target server
+    /// Process SOCKS request and optionally establish connection to target.
     ///
-    /// Returns a tuple of (response, remote_stream):
-    /// - On success: (Success response with bind address, Some(remote TcpStream))
-    /// - On failure: (Error response, None)
-    ///
-    /// This function handles:
-    /// - Address resolution (IPv4, IPv6, domain names)
-    /// - TCP connection establishment with timeout
-    /// - Error mapping to appropriate SOCKS reply codes
+    /// Returns `(response, Option<remote_stream>)`.
     async fn process_request(
         request: &SocksRequest,
-        _remote_peer: &SocketAddr,
+        config: &ServerConfig,
     ) -> Result<(SocksResponse, Option<TcpStream>), SocksError> {
         match request.command {
             SocksCommand::Connect => {
-                // Resolve the target address to a SocketAddr
-                let target_addr = resolve_address(&request.address).await?;
+                let target_addr = resolve_address(&request.address, config).await?;
 
-                tracing::debug!(
-                    target = %target_addr,
-                    "Connecting to target server"
-                );
+                tracing::debug!(target = %target_addr, "Connecting to target server");
 
-                // Connect with timeout to prevent hanging on unreachable hosts
-                let remote_stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
-                    Ok(Ok(stream)) => {
-                        tracing::debug!("Successfully connected to target");
-                        stream
-                    }
-                    Ok(Err(err)) => {
-                        // Map the connection error to a SOCKS error
-                        let socks_error = map_connect_error(err);
-                        tracing::debug!(
-                            error = %socks_error,
-                            "Connection failed"
-                        );
-                        let reply_code = match &socks_error {
-                            SocksError::ConnectionRefused => ReplyCode::ConnectionRefused,
-                            SocksError::NetworkUnreachable => ReplyCode::NetworkUnreachable,
-                            SocksError::HostUnreachable => ReplyCode::HostUnreachable,
-                            SocksError::TtlExpired => ReplyCode::TtlExpired,
-                            SocksError::ConnectionNotAllowed => ReplyCode::ConnectionNotAllowed,
-                            _ => ReplyCode::GeneralFailure,
-                        };
-                        return Ok((
-                            SocksResponse::new(reply_code, Self::get_unspec_address()),
-                            None,
-                        ));
-                    }
-                    Err(_) => {
-                        // Timeout occurred
-                        tracing::debug!("Connection timed out");
-                        return Ok((
-                            SocksResponse::new(ReplyCode::TtlExpired, Self::get_unspec_address()),
-                            None,
-                        ));
-                    }
-                };
+                let remote_stream =
+                    match timeout(config.connect_timeout, TcpStream::connect(target_addr)).await {
+                        Ok(Ok(stream)) => {
+                            tracing::debug!("Successfully connected to target");
+                            stream
+                        }
+                        Ok(Err(err)) => {
+                            let socks_error = map_connect_error(err);
+                            tracing::debug!(error = %socks_error, "Connection failed");
+                            let reply_code = match &socks_error {
+                                SocksError::ConnectionRefused => ReplyCode::ConnectionRefused,
+                                SocksError::NetworkUnreachable => ReplyCode::NetworkUnreachable,
+                                SocksError::HostUnreachable => ReplyCode::HostUnreachable,
+                                SocksError::TtlExpired => ReplyCode::TtlExpired,
+                                SocksError::ConnectionNotAllowed => {
+                                    ReplyCode::ConnectionNotAllowed
+                                }
+                                _ => ReplyCode::GeneralFailure,
+                            };
+                            return Ok((
+                                SocksResponse::new(reply_code, Self::get_unspec_address()),
+                                None,
+                            ));
+                        }
+                        Err(_) => {
+                            tracing::debug!("Connection timed out");
+                            return Ok((
+                                SocksResponse::new(
+                                    ReplyCode::TtlExpired,
+                                    Self::get_unspec_address(),
+                                ),
+                                None,
+                            ));
+                        }
+                    };
 
-                // Get the local address of our connection to the target
-                // This will be used as the bind address in the response
-                let bind_addr = remote_stream
-                    .local_addr()
-                    .map(|addr| match addr {
-                        SocketAddr::V4(v4) => SocksAddress::Ipv4(*v4.ip(), v4.port()),
-                        SocketAddr::V6(v6) => SocksAddress::Ipv6(*v6.ip(), v6.port()),
-                    })
-                    .unwrap_or_else(|_| Self::get_unspec_address());
+                // Return unspecified address to avoid leaking internal network topology
+                let bind_addr = Self::get_unspec_address();
 
                 Ok((
                     SocksResponse::new(ReplyCode::Success, bind_addr),
                     Some(remote_stream),
                 ))
             }
-            SocksCommand::Bind => {
-                // BIND is not supported
-                Ok((
-                    SocksResponse::new(ReplyCode::CommandNotSupported, Self::get_unspec_address()),
-                    None,
-                ))
-            }
-            SocksCommand::UdpAssociate => {
-                // UDP ASSOCIATE is not supported
-                Ok((
-                    SocksResponse::new(ReplyCode::CommandNotSupported, Self::get_unspec_address()),
-                    None,
-                ))
-            }
+            SocksCommand::Bind | SocksCommand::UdpAssociate => Ok((
+                SocksResponse::new(ReplyCode::CommandNotSupported, Self::get_unspec_address()),
+                None,
+            )),
         }
     }
 
-    /// Get unspecified address based on what makes sense
     fn get_unspec_address() -> SocksAddress {
         SocksAddress::Ipv4(Ipv4Addr::UNSPECIFIED, 0)
     }
 
-    /// Send SOCKS response
     async fn send_response<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         response: &SocksResponse,
@@ -409,10 +523,7 @@ impl Connection {
         response.write_to(writer).await
     }
 
-    /// Relay data between client and remote server bidirectionally
-    ///
-    /// Uses tokio's copy_bidirectional for efficient data transfer.
-    /// This function runs until either side closes the connection or an error occurs.
+    /// Relay data between client and remote server bidirectionally.
     async fn relay_data<C, R>(client: &mut C, remote: R)
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -420,8 +531,6 @@ impl Connection {
     {
         let mut remote_ref = remote;
 
-        // Use copy_bidirectional for efficient relay
-        // This copies data in both directions simultaneously
         let result = tokio::io::copy_bidirectional(&mut *client, &mut remote_ref).await;
 
         match result {
@@ -439,36 +548,44 @@ impl Connection {
     }
 }
 
-/// Run the SOCKS5 server on the default port (1080)
+// ============================================================================
+// Server entry points
+// ============================================================================
+
+/// Run the SOCKS5 server on the default port (1080) with default config.
 #[tracing::instrument(name = "server")]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    run_on_port(1080).await
+    run_with_config(1080, ServerConfig::default()).await
 }
 
-/// Run the SOCKS5 server on a specific port
-///
-/// This function is used for both production and testing.
-/// For tests, use a port in the range 10000+ to avoid conflicts.
+/// Run the SOCKS5 server on a specific port with default config.
 #[tracing::instrument(name = "server", skip())]
 pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_config(port, ServerConfig::default()).await
+}
+
+/// Run the SOCKS5 server on a specific port with the given configuration.
+#[tracing::instrument(name = "server", skip(config))]
+pub async fn run_with_config(
+    port: u16,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("SOCKS5 server listening on {}", addr);
 
+    let config = Arc::new(config);
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
 
-    // CRITICAL FIX: Connection rate limiting
     let tracker = Arc::new(ConnectionTracker::new(
-        MAX_CONNECTIONS_PER_IP,
-        MAX_CONCURRENT_CONNECTIONS,
+        config.max_connections_per_ip,
+        config.max_concurrent_connections,
     ));
 
-    // Graceful shutdown configuration
-    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+    let shutdown_timeout = config.shutdown_timeout;
 
-    // Setup SIGTERM handler (Unix only)
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Pin the shutdown signal future so it can be polled repeatedly in select!
+    let mut shutdown = std::pin::pin!(wait_for_shutdown_signal());
 
     loop {
         tokio::select! {
@@ -476,35 +593,38 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             result = listener.accept() => {
                 match result {
                     Ok((socket, remote_peer)) => {
-                        // CRITICAL FIX: Check connection limits
                         let client_ip = remote_peer.ip();
-                        if !tracker.try_acquire(client_ip).await {
-                            tracing::warn!(
-                                ip = %client_ip,
-                                "Connection limit exceeded, rejecting"
-                            );
-                            drop(socket);
-                            continue;
-                        }
 
-                        // PERF FIX: Set TCP_NODELAY for lower latency
+                        // Check connection limits (semaphore + per-IP, no race condition)
+                        let permit = match tracker.try_acquire(client_ip) {
+                            Some(p) => p,
+                            None => {
+                                tracing::warn!(ip = %client_ip, "Connection limit exceeded, rejecting");
+                                drop(socket);
+                                continue;
+                            }
+                        };
+
                         if let Err(e) = socket.set_nodelay(true) {
                             tracing::warn!("Failed to set TCP_NODELAY: {}", e);
                         }
 
                         tracing::debug!(%remote_peer, "Accepted connection");
 
-                        // Clone tracker for this connection
                         let conn_tracker = Arc::clone(&tracker);
+                        let conn_config = Arc::clone(&config);
 
                         join_set.spawn(async move {
-                            // Create guard to ensure we release the permit when connection ends
+                            // RAII guard: releases per-IP count + semaphore on drop
                             let _guard = ConnectionGuard {
                                 tracker: conn_tracker,
                                 ip: client_ip,
+                                _permit: permit,
                             };
 
-                            Connection::new(socket, remote_peer).process().await
+                            Connection::new(socket, remote_peer, conn_config)
+                                .process()
+                                .await
                         });
                     }
                     Err(err) => {
@@ -512,14 +632,16 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
-            // Handle SIGINT (Ctrl+C)
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received SIGINT, initiating graceful shutdown...");
-                break;
-            }
-            // Handle SIGTERM (Unix only)
-            _ = sigterm.recv(), if cfg!(unix) => {
-                tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+            // Drain completed tasks to prevent memory accumulation
+            Some(result) = join_set.join_next() => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::debug!("Connection error: {}", err),
+                    Err(err) => tracing::debug!("Task panic: {}", err),
+                }
+            },
+            // Shutdown signal
+            _ = &mut shutdown => {
                 break;
             }
         }
@@ -527,30 +649,33 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown with timeout
     let active_connections = join_set.len();
-    tracing::info!("Waiting for {} active connections to close (timeout: {:?})...",
-                   active_connections, SHUTDOWN_TIMEOUT);
+    tracing::info!(
+        "Waiting for {} active connections to close (timeout: {:?})...",
+        active_connections,
+        shutdown_timeout
+    );
 
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+    match tokio::time::timeout(shutdown_timeout, async {
         while let Some(res) = join_set.join_next().await {
             match res {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::debug!("Connection completed with error: {}", err);
-                }
-                Err(err) => {
-                    tracing::debug!("Task cancelled: {}", err);
-                }
+                Ok(Err(err)) => tracing::debug!("Connection completed with error: {}", err),
+                Err(err) => tracing::debug!("Task cancelled: {}", err),
             }
         }
-    }).await {
+    })
+    .await
+    {
         Ok(()) => {
             tracing::info!("All {} connections closed gracefully", active_connections);
         }
         Err(_) => {
-            tracing::warn!("Timeout waiting for connections to close, aborting {} tasks...",
-                          join_set.len());
+            tracing::warn!(
+                "Timeout waiting for connections to close, aborting {} tasks...",
+                join_set.len()
+            );
             join_set.abort_all();
-            // Give aborted tasks a moment to clean up
+            // Give aborted tasks a moment to run Drop handlers
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
