@@ -51,20 +51,21 @@ A high-performance, reliable SOCKS5 proxy server implementation in Rust, built w
 ### Medium Priority
 
 - [ ] **Configuration file support** - TOML/YAML config
-  - [ ] Listen address/port
-  - [ ] Authentication methods
-  - [ ] Connection timeouts
-  - [ ] Logging configuration
+  - [x] Listen address/port ✅
+  - [x] Authentication methods ✅
+  - [x] Connection timeouts ✅
+  - [x] Logging configuration ✅
+  - [x] Rate limiting ✅
 - [ ] **Access control lists (ACL)**
   - [ ] IP whitelist/blacklist
   - [ ] Domain filtering
   - [ ] Port restrictions
   - [ ] Per-IP connection limits
-- [ ] **Rate limiting**
-  - [ ] Requests per second
-  - [ ] Bandwidth limits
-  - [ ] Per-IP rate limiting
-  - [ ] Connection rate limiting
+- [x] **Rate limiting** ✅
+  - [x] Requests per second ✅
+  - [x] Bandwidth limits ✅
+  - [x] Per-IP rate limiting ✅
+  - [x] Connection rate limiting ✅
 
 ### Low Priority
 

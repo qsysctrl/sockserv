@@ -1,0 +1,40 @@
+# sockserv — SOCKS5 proxy server configuration
+# Copy this file to config.toml and adjust as needed.
+
+[server]
+listen_address = "127.0.0.1"   # IP address to bind to
+listen_port = 1080              # Port to listen on
+
+[auth]
+method = "none"                 # "none" or "password"
+# [auth.users]                  # Required when method = "password"
+# alice = "secret123"
+# bob = "hunter2"
+
+[timeouts]
+client_read = 30                # Client read timeout (seconds)
+connect = 10                    # Upstream connect timeout (seconds)
+dns = 5                         # DNS resolution timeout (seconds)
+connection = 300                # Total connection lifetime (seconds)
+shutdown = 30                   # Graceful shutdown timeout (seconds)
+bind = 60                       # BIND accept timeout (seconds)
+udp_idle = 120                  # UDP relay idle timeout (seconds)
+
+[limits]
+max_concurrent_connections = 10000
+max_connections_per_ip = 100
+max_auth_methods = 128
+udp_buffer_size = 65535         # UDP relay buffer size (bytes)
+
+[rate_limit]
+connection_rate = 0                 # Max new connections/sec globally (0 = unlimited)
+per_ip_rps = 0                     # Max requests/sec per IP (0 = unlimited)
+bandwidth_per_connection = 0        # Max bytes/sec per connection (0 = unlimited)
+bandwidth_total = 0                 # Max bytes/sec total across all connections (0 = unlimited)
+
+[security]
+allow_private_destinations = false  # WARNING: enabling allows SSRF attacks
+
+[logging]
+level = "info"                  # Tracing filter directive (e.g. "debug", "info,sockserv=debug")
+format = "compact"              # "compact", "full", or "json"

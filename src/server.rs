@@ -6,11 +6,13 @@ use protocol::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant, Sleep};
 
 // ============================================================================
 // Configuration
@@ -45,6 +47,14 @@ pub struct ServerConfig {
     pub udp_idle_timeout: Duration,
     /// Buffer size for UDP relay datagrams
     pub udp_buffer_size: usize,
+    /// Maximum new connections accepted per second globally (0 = unlimited)
+    pub connection_rate_limit: u32,
+    /// Maximum requests per second per IP address (0 = unlimited)
+    pub per_ip_rps: u32,
+    /// Maximum bandwidth per connection in bytes/sec (0 = unlimited)
+    pub bandwidth_per_connection: u64,
+    /// Maximum total bandwidth in bytes/sec (0 = unlimited)
+    pub bandwidth_total: u64,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +73,10 @@ impl Default for ServerConfig {
             bind_timeout: Duration::from_secs(60),
             udp_idle_timeout: Duration::from_secs(120),
             udp_buffer_size: 65535,
+            connection_rate_limit: 0,
+            per_ip_rps: 0,
+            bandwidth_per_connection: 0,
+            bandwidth_total: 0,
         }
     }
 }
@@ -115,6 +129,308 @@ fn is_private_or_reserved_v6(v6: &Ipv6Addr) -> bool {
 }
 
 // ============================================================================
+// Token bucket rate limiter
+// ============================================================================
+
+/// A simple token bucket for rate limiting.
+/// Thread-safe via interior `StdMutex`.
+struct TokenBucket {
+    state: StdMutex<TokenBucketState>,
+}
+
+struct TokenBucketState {
+    tokens: f64,
+    capacity: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// Create a new token bucket.
+    /// `capacity` is the burst size, `rate` is tokens added per second.
+    fn new(capacity: f64, rate: f64) -> Self {
+        Self {
+            state: StdMutex::new(TokenBucketState {
+                tokens: capacity,
+                capacity,
+                refill_rate: rate,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    /// Try to consume `n` tokens. Returns `true` if allowed.
+    fn try_consume(&self, n: f64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.refill();
+        if state.tokens >= n {
+            state.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume up to `n` tokens. Returns the number of tokens actually consumed (may be 0).
+    fn consume_up_to(&self, n: f64) -> f64 {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.refill();
+        let consumed = n.min(state.tokens).max(0.0);
+        state.tokens -= consumed;
+        consumed
+    }
+
+    /// Time until at least `n` tokens are available. Returns `Duration::ZERO` if already available.
+    fn time_until(&self, n: f64) -> Duration {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let deficit = n - state.tokens;
+        if deficit <= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(deficit / state.refill_rate)
+        }
+    }
+}
+
+impl TokenBucketState {
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        self.last_refill = now;
+    }
+}
+
+// ============================================================================
+// Per-IP rate limiter
+// ============================================================================
+
+/// Tracks per-IP request rates using token buckets.
+struct IpRateLimiter {
+    buckets: StdMutex<HashMap<IpAddr, Arc<TokenBucket>>>,
+    rps: u32,
+}
+
+impl IpRateLimiter {
+    fn new(rps: u32) -> Self {
+        Self {
+            buckets: StdMutex::new(HashMap::new()),
+            rps,
+        }
+    }
+
+    /// Check if an IP is allowed to make a request. Returns `true` if allowed.
+    fn check(&self, ip: IpAddr) -> bool {
+        if self.rps == 0 {
+            return true;
+        }
+        let bucket = {
+            let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(buckets.entry(ip).or_insert_with(|| {
+                // Burst = 2x RPS to allow short spikes
+                Arc::new(TokenBucket::new(self.rps as f64 * 2.0, self.rps as f64))
+            }))
+        };
+        bucket.try_consume(1.0)
+    }
+
+    /// Remove stale entries (IPs with no active connections).
+    /// Called periodically from the accept loop.
+    fn cleanup(&self, active_ips: &HashMap<IpAddr, usize>) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        buckets.retain(|ip, _| active_ips.contains_key(ip));
+    }
+}
+
+// ============================================================================
+// Bandwidth limiter
+// ============================================================================
+
+/// Global bandwidth limiter shared across all connections.
+struct BandwidthLimiter {
+    bucket: TokenBucket,
+}
+
+impl BandwidthLimiter {
+    fn new(bytes_per_sec: u64) -> Self {
+        // Burst = 1 second worth of bandwidth
+        let bps = bytes_per_sec as f64;
+        Self {
+            bucket: TokenBucket::new(bps, bps),
+        }
+    }
+
+    /// Consume up to `requested` bytes. Returns actual bytes allowed.
+    fn consume(&self, requested: usize) -> usize {
+        self.bucket.consume_up_to(requested as f64) as usize
+    }
+
+    /// Time until at least 1 byte is available.
+    fn time_until_available(&self) -> Duration {
+        self.bucket.time_until(1.0)
+    }
+}
+
+/// Wraps an async stream with per-connection + global bandwidth throttling.
+struct ThrottledStream<S> {
+    inner: S,
+    per_conn: Option<Arc<TokenBucket>>,
+    global: Option<Arc<BandwidthLimiter>>,
+    delay: Option<Pin<Box<Sleep>>>,
+}
+
+impl<S> ThrottledStream<S> {
+    fn new(
+        inner: S,
+        per_conn_bps: u64,
+        global: Option<Arc<BandwidthLimiter>>,
+    ) -> Self {
+        let per_conn = if per_conn_bps > 0 {
+            let bps = per_conn_bps as f64;
+            Some(Arc::new(TokenBucket::new(bps, bps)))
+        } else {
+            None
+        };
+        Self {
+            inner,
+            per_conn,
+            global,
+            delay: None,
+        }
+    }
+
+    fn limit_bytes(&self, requested: usize) -> usize {
+        let mut allowed = requested;
+
+        if let Some(ref pc) = self.per_conn {
+            let consumed = pc.consume_up_to(allowed as f64) as usize;
+            allowed = consumed;
+        }
+
+        if let Some(ref g) = self.global {
+            let consumed = g.consume(allowed);
+            allowed = consumed;
+        }
+
+        allowed
+    }
+
+    fn min_wait_time(&self) -> Duration {
+        let mut wait = Duration::ZERO;
+
+        if let Some(ref pc) = self.per_conn {
+            let t = pc.time_until(1.0);
+            if t > wait {
+                wait = t;
+            }
+        }
+
+        if let Some(ref g) = self.global {
+            let t = g.time_until_available();
+            if t > wait {
+                wait = t;
+            }
+        }
+
+        wait
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ThrottledStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // If we're waiting on a delay, poll it first
+        if let Some(ref mut delay) = this.delay {
+            match delay.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.delay = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Check how many bytes we're allowed to read
+        let remaining = buf.remaining();
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let allowed = this.limit_bytes(remaining);
+        if allowed == 0 {
+            // Schedule a wake-up after a short wait
+            let wait = this.min_wait_time().max(Duration::from_millis(1));
+            this.delay = Some(Box::pin(tokio::time::sleep(wait)));
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        // Limit the buffer size to what we're allowed
+        let mut limited_buf = buf.take(allowed);
+        let before = limited_buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, &mut limited_buf);
+        let after = limited_buf.filled().len();
+        let bytes_read = after - before;
+
+        // Advance the original buffer by however many bytes were read
+        // We need to unsafe-advance buf because take() created a separate view
+        if bytes_read > 0 {
+            // The bytes were written into buf's underlying memory via limited_buf
+            unsafe { buf.assume_init(buf.filled().len() + bytes_read) };
+            buf.advance(bytes_read);
+        }
+
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ThrottledStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
+        // If we're waiting on a delay, poll it first
+        if let Some(ref mut delay) = this.delay {
+            match delay.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.delay = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let allowed = this.limit_bytes(buf.len());
+        if allowed == 0 {
+            let wait = this.min_wait_time().max(Duration::from_millis(1));
+            this.delay = Some(Box::pin(tokio::time::sleep(wait)));
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        Pin::new(&mut this.inner).poll_write(cx, &buf[..allowed])
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+// ============================================================================
 // Connection tracking and rate limiting
 // ============================================================================
 
@@ -122,15 +438,37 @@ struct ConnectionTracker {
     ip_counts: StdMutex<HashMap<IpAddr, usize>>,
     max_per_ip: usize,
     semaphore: Arc<Semaphore>,
+    ip_rate_limiter: IpRateLimiter,
+    accept_rate: Option<TokenBucket>,
 }
 
 impl ConnectionTracker {
-    fn new(max_per_ip: usize, max_total: usize) -> Self {
+    fn new(max_per_ip: usize, max_total: usize, per_ip_rps: u32, accept_rate: u32) -> Self {
         Self {
             ip_counts: StdMutex::new(HashMap::new()),
             max_per_ip,
             semaphore: Arc::new(Semaphore::new(max_total)),
+            ip_rate_limiter: IpRateLimiter::new(per_ip_rps),
+            accept_rate: if accept_rate > 0 {
+                // Burst = 2x rate for small spikes
+                Some(TokenBucket::new(accept_rate as f64 * 2.0, accept_rate as f64))
+            } else {
+                None
+            },
         }
+    }
+
+    /// Check global connection accept rate. Returns `true` if allowed.
+    fn check_accept_rate(&self) -> bool {
+        match &self.accept_rate {
+            Some(bucket) => bucket.try_consume(1.0),
+            None => true,
+        }
+    }
+
+    /// Check per-IP request rate. Returns `true` if allowed.
+    fn check_ip_rate(&self, ip: IpAddr) -> bool {
+        self.ip_rate_limiter.check(ip)
     }
 
     fn try_acquire(&self, ip: IpAddr) -> Option<ConnectionPermit> {
@@ -152,6 +490,12 @@ impl ConnectionTracker {
                 counts.remove(&ip);
             }
         }
+    }
+
+    /// Periodically clean up stale per-IP rate limiter entries.
+    fn cleanup_rate_limiters(&self) {
+        let counts = self.ip_counts.lock().unwrap_or_else(|e| e.into_inner());
+        self.ip_rate_limiter.cleanup(&counts);
     }
 }
 
@@ -293,14 +637,21 @@ struct Connection {
     socket: TcpStream,
     remote_peer: SocketAddr,
     config: Arc<ServerConfig>,
+    global_bandwidth: Option<Arc<BandwidthLimiter>>,
 }
 
 impl Connection {
-    fn new(socket: TcpStream, remote_peer: SocketAddr, config: Arc<ServerConfig>) -> Self {
+    fn new(
+        socket: TcpStream,
+        remote_peer: SocketAddr,
+        config: Arc<ServerConfig>,
+        global_bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> Self {
         Self {
             socket,
             remote_peer,
             config,
+            global_bandwidth,
         }
     }
 
@@ -312,6 +663,8 @@ impl Connection {
     )]
     async fn process(self) -> Result<(), SocksError> {
         let config = Arc::clone(&self.config);
+        let global_bw = self.global_bandwidth.clone();
+        let per_conn_bps = config.bandwidth_per_connection;
         let local_addr = self
             .socket
             .local_addr()
@@ -380,10 +733,16 @@ impl Connection {
                     tracing::debug!(reply = response.reply as u8, "Sending CONNECT response");
                     Self::send_response(&mut write_half, &response).await?;
 
-                    let mut client_stream = read_half
+                    let client_stream = read_half
                         .reunite(write_half)
                         .map_err(|_| SocksError::InvalidRequest)?;
-                    Self::relay_data(&mut client_stream, remote_stream).await;
+                    let mut throttled_client = ThrottledStream::new(
+                        client_stream, per_conn_bps, global_bw.clone(),
+                    );
+                    let mut throttled_remote = ThrottledStream::new(
+                        remote_stream, per_conn_bps, global_bw.clone(),
+                    );
+                    Self::relay_data(&mut throttled_client, &mut throttled_remote).await;
                 }
 
                 // ---- BIND ----
@@ -415,10 +774,16 @@ impl Connection {
                             );
                             Self::send_response(&mut write_half, &second_response).await?;
 
-                            let mut client_stream = read_half
+                            let client_stream = read_half
                                 .reunite(write_half)
                                 .map_err(|_| SocksError::InvalidRequest)?;
-                            Self::relay_data(&mut client_stream, remote_stream).await;
+                            let mut throttled_client = ThrottledStream::new(
+                                client_stream, per_conn_bps, global_bw.clone(),
+                            );
+                            let mut throttled_remote = ThrottledStream::new(
+                                remote_stream, per_conn_bps, global_bw.clone(),
+                            );
+                            Self::relay_data(&mut throttled_client, &mut throttled_remote).await;
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("BIND accept error: {}", e);
@@ -708,13 +1073,12 @@ impl Connection {
     // ========================================================================
 
     /// Relay data bidirectionally between client and remote (TCP).
-    async fn relay_data<C, R>(client: &mut C, remote: R)
+    async fn relay_data<C, R>(client: &mut C, remote: &mut R)
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let mut remote_ref = remote;
-        let result = tokio::io::copy_bidirectional(&mut *client, &mut remote_ref).await;
+        let result = tokio::io::copy_bidirectional(client, remote).await;
         match result {
             Ok((c2r, r2c)) => {
                 tracing::debug!(
@@ -858,22 +1222,26 @@ impl Connection {
 
 #[tracing::instrument(name = "server")]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    run_with_config(1080, ServerConfig::default()).await
+    let addr: std::net::SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    run_with_config(addr, ServerConfig::default()).await
 }
 
 #[tracing::instrument(name = "server", skip())]
 pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_config(port, ServerConfig::default()).await
+    let addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+    );
+    run_with_config(addr, ServerConfig::default()).await
 }
 
 #[tracing::instrument(name = "server", skip(config))]
 pub async fn run_with_config(
-    port: u16,
+    listen_addr: std::net::SocketAddr,
     config: ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("SOCKS5 server listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    tracing::info!("SOCKS5 server listening on {}", listen_addr);
 
     let config = Arc::new(config);
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
@@ -881,7 +1249,17 @@ pub async fn run_with_config(
     let tracker = Arc::new(ConnectionTracker::new(
         config.max_connections_per_ip,
         config.max_concurrent_connections,
+        config.per_ip_rps,
+        config.connection_rate_limit,
     ));
+
+    let global_bandwidth = if config.bandwidth_total > 0 {
+        Some(Arc::new(BandwidthLimiter::new(config.bandwidth_total)))
+    } else {
+        None
+    };
+
+    let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
 
     let shutdown_timeout = config.shutdown_timeout;
     let mut shutdown = std::pin::pin!(wait_for_shutdown_signal());
@@ -892,6 +1270,21 @@ pub async fn run_with_config(
                 match result {
                     Ok((socket, remote_peer)) => {
                         let client_ip = remote_peer.ip();
+
+                        // Global connection rate limit
+                        if !tracker.check_accept_rate() {
+                            tracing::debug!(ip = %client_ip, "Connection rate limited");
+                            drop(socket);
+                            continue;
+                        }
+
+                        // Per-IP request rate limit
+                        if !tracker.check_ip_rate(client_ip) {
+                            tracing::debug!(ip = %client_ip, "Per-IP rate limited");
+                            drop(socket);
+                            continue;
+                        }
+
                         let permit = match tracker.try_acquire(client_ip) {
                             Some(p) => p,
                             None => {
@@ -909,6 +1302,7 @@ pub async fn run_with_config(
 
                         let conn_tracker = Arc::clone(&tracker);
                         let conn_config = Arc::clone(&config);
+                        let conn_bw = global_bandwidth.clone();
 
                         join_set.spawn(async move {
                             let _guard = ConnectionGuard {
@@ -916,7 +1310,7 @@ pub async fn run_with_config(
                                 ip: client_ip,
                                 _permit: permit,
                             };
-                            Connection::new(socket, remote_peer, conn_config)
+                            Connection::new(socket, remote_peer, conn_config, conn_bw)
                                 .process()
                                 .await
                         });
@@ -932,6 +1326,9 @@ pub async fn run_with_config(
                     Ok(Err(err)) => tracing::debug!("Connection error: {}", err),
                     Err(err) => tracing::debug!("Task panic: {}", err),
                 }
+            },
+            _ = cleanup_interval.tick() => {
+                tracker.cleanup_rate_limiters();
             },
             _ = &mut shutdown => {
                 break;
@@ -964,4 +1361,148 @@ pub async fn run_with_config(
 
     tracing::info!("SOCKS5 server shutdown complete");
     Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_bucket_basic() {
+        let bucket = TokenBucket::new(10.0, 10.0);
+        // Should allow 10 tokens initially (full bucket)
+        for _ in 0..10 {
+            assert!(bucket.try_consume(1.0));
+        }
+        // 11th should fail
+        assert!(!bucket.try_consume(1.0));
+    }
+
+    #[test]
+    fn test_token_bucket_consume_up_to() {
+        let bucket = TokenBucket::new(5.0, 100.0);
+        // Request 10, should only get 5
+        let consumed = bucket.consume_up_to(10.0);
+        assert!((consumed - 5.0).abs() < 0.01);
+        // Bucket is empty now
+        let consumed = bucket.consume_up_to(10.0);
+        assert!(consumed < 0.01);
+    }
+
+    #[test]
+    fn test_token_bucket_time_until() {
+        let bucket = TokenBucket::new(10.0, 10.0);
+        // Drain the bucket
+        bucket.try_consume(10.0);
+        // Should need ~1 second for 10 tokens at rate 10/s
+        let wait = bucket.time_until(10.0);
+        assert!(wait.as_secs_f64() > 0.9 && wait.as_secs_f64() < 1.1);
+        // Already available = zero wait
+        let bucket2 = TokenBucket::new(10.0, 10.0);
+        assert_eq!(bucket2.time_until(5.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_ip_rate_limiter_unlimited() {
+        let limiter = IpRateLimiter::new(0);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // Should always allow when rps = 0
+        for _ in 0..1000 {
+            assert!(limiter.check(ip));
+        }
+    }
+
+    #[test]
+    fn test_ip_rate_limiter_limited() {
+        let limiter = IpRateLimiter::new(5);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // Burst = 2x RPS = 10
+        for _ in 0..10 {
+            assert!(limiter.check(ip));
+        }
+        // Next should be rate limited
+        assert!(!limiter.check(ip));
+    }
+
+    #[test]
+    fn test_ip_rate_limiter_per_ip_isolation() {
+        let limiter = IpRateLimiter::new(5);
+        let ip1: IpAddr = "1.2.3.4".parse().unwrap();
+        let ip2: IpAddr = "5.6.7.8".parse().unwrap();
+        // Exhaust ip1's bucket
+        for _ in 0..10 {
+            limiter.check(ip1);
+        }
+        assert!(!limiter.check(ip1));
+        // ip2 should still be fine
+        assert!(limiter.check(ip2));
+    }
+
+    #[test]
+    fn test_connection_tracker_accept_rate() {
+        let tracker = ConnectionTracker::new(100, 1000, 0, 5);
+        // Burst = 10
+        for _ in 0..10 {
+            assert!(tracker.check_accept_rate());
+        }
+        assert!(!tracker.check_accept_rate());
+    }
+
+    #[test]
+    fn test_connection_tracker_accept_rate_unlimited() {
+        let tracker = ConnectionTracker::new(100, 1000, 0, 0);
+        for _ in 0..10000 {
+            assert!(tracker.check_accept_rate());
+        }
+    }
+
+    #[test]
+    fn test_connection_tracker_ip_rate() {
+        let tracker = ConnectionTracker::new(100, 1000, 10, 0);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // Burst = 20
+        for _ in 0..20 {
+            assert!(tracker.check_ip_rate(ip));
+        }
+        assert!(!tracker.check_ip_rate(ip));
+    }
+
+    #[test]
+    fn test_bandwidth_limiter() {
+        let limiter = BandwidthLimiter::new(1000);
+        // Should allow up to 1000 bytes initially
+        let consumed = limiter.consume(500);
+        assert_eq!(consumed, 500);
+        let consumed = limiter.consume(800);
+        assert_eq!(consumed, 500); // only 500 left
+        let consumed = limiter.consume(100);
+        assert_eq!(consumed, 0); // empty
+    }
+
+    #[test]
+    fn test_is_private_or_reserved_v4() {
+        assert!(is_private_or_reserved_v4(&Ipv4Addr::LOCALHOST));
+        assert!(is_private_or_reserved_v4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_private_or_reserved_v4(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(is_private_or_reserved_v4(&Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(is_private_or_reserved_v4(&Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
+        assert!(!is_private_or_reserved_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_or_reserved_v4(&Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn test_cleanup_rate_limiters() {
+        let tracker = ConnectionTracker::new(100, 1000, 10, 0);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // Generate a rate limiter entry
+        tracker.check_ip_rate(ip);
+        // No active connections → cleanup should remove it
+        tracker.cleanup_rate_limiters();
+        let buckets = tracker.ip_rate_limiter.buckets.lock().unwrap();
+        assert!(buckets.is_empty());
+    }
 }

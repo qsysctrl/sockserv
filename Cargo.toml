@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]

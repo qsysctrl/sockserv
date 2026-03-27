@@ -2,4 +2,5 @@
 //!
 //! This library provides a high-performance SOCKS5 proxy server implementation.
 
+pub mod config;
 pub mod server;

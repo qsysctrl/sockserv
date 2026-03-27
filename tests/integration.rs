@@ -97,7 +97,11 @@ async fn start_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             allow_private_destinations: true,
             ..ServerConfig::default()
         };
-        let _ = server::run_with_config(port, config).await;
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        );
+        let _ = server::run_with_config(addr, config).await;
     });
 
     (handle, ready)
@@ -730,7 +734,11 @@ async fn start_auth_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             credentials: Some(credentials),
             ..ServerConfig::default()
         };
-        let _ = server::run_with_config(port, config).await;
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        );
+        let _ = server::run_with_config(addr, config).await;
     });
 
     (handle, ready)
