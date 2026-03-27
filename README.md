@@ -43,10 +43,11 @@ A high-performance SOCKS5 proxy server implementation in Rust, built with Tokio.
 - Rate limiting (Token Bucket algorithm)
 - Configuration file support (TOML)
 - **Access Control Lists (ACL)**
+- **Prometheus Metrics/Monitoring**
 
 ### In Progress
 
-- Metrics/Monitoring (Prometheus)
+- None (all major features implemented)
 
 ### Future
 
@@ -441,6 +442,43 @@ max_connections_per_ip = 50
 ```
 
 **Important**: Whitelist and blacklist are mutually exclusive for each category. If both are empty, all traffic is allowed (subject to other security settings).
+
+### Prometheus Metrics
+
+The server exposes Prometheus-compatible metrics on a separate HTTP endpoint.
+
+**Default endpoint**: `http://127.0.0.1:9090/metrics`
+
+**Available metrics**:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `connections_total` | Counter | Total connections accepted (by remote IP) |
+| `connections_active` | Gauge | Current active connections |
+| `connections_rejected_total` | Counter | Total connections rejected (by remote IP) |
+| `acl_decisions_total` | Counter | ACL decisions by type (ip/domain/port) and result (allow/deny) |
+| `bytes_transferred_total` | Histogram | Bytes transferred (rx/tx) with size buckets |
+| `errors_total` | Counter | Errors by type |
+| `requests_total` | Counter | SOCKS requests by command (CONNECT/BIND/UDP_ASSOCIATE) |
+| `request_duration_seconds` | Histogram | Request duration in seconds |
+| `auth_attempts_total` | Counter | Total authentication attempts |
+| `auth_success_total` | Counter | Successful authentications |
+| `auth_failure_total` | Counter | Failed authentications |
+
+**Example scrape**:
+```bash
+curl http://127.0.0.1:9090/metrics
+```
+
+**Health check endpoint**: `http://127.0.0.1:9090/health`
+
+**Example Prometheus config**:
+```yaml
+scrape_configs:
+  - job_name: 'sockserv'
+    static_configs:
+      - targets: ['localhost:9090']
+```
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|

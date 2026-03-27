@@ -1,5 +1,6 @@
 use sockserv::config::FileConfig;
 use sockserv::server::acl::AclManager;
+use sockserv::server::metrics::MetricsManager;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -23,8 +24,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create ACL manager
     let acl_manager = AclManager::new(&acl_config)?;
+    
+    // Create metrics manager
+    let metrics_manager = MetricsManager::new();
 
-    sockserv::server::run_with_config(listen_addr, server_config, acl_manager).await?;
+    sockserv::server::run_with_config(listen_addr, server_config, acl_manager, metrics_manager).await?;
 
     Ok(())
 }

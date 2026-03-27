@@ -12,6 +12,10 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+prometheus-client = "0.22"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]

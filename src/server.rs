@@ -1,7 +1,11 @@
 pub mod acl;
+pub mod metrics;
+pub mod metrics_server;
 pub mod protocol;
 
 use acl::AclManager;
+use metrics::{AclDecisionLabel, MetricsManager};
+use metrics_server::{run_metrics_server, MetricsServerConfig};
 use protocol::{
     AuthMethod, AuthRequest, AuthResponse, ClientHello, ReplyCode, ServerHello, SocksAddress,
     SocksCommand, SocksError, SocksRequest, SocksResponse, UdpRelayHeader, SOCKS_VERSION,
@@ -641,6 +645,7 @@ struct Connection {
     config: Arc<ServerConfig>,
     global_bandwidth: Option<Arc<BandwidthLimiter>>,
     acl_manager: Arc<AclManager>,
+    metrics: Arc<MetricsManager>,
 }
 
 impl Connection {
@@ -650,6 +655,7 @@ impl Connection {
         config: Arc<ServerConfig>,
         global_bandwidth: Option<Arc<BandwidthLimiter>>,
         acl_manager: Arc<AclManager>,
+        metrics: Arc<MetricsManager>,
     ) -> Self {
         Self {
             socket,
@@ -657,6 +663,7 @@ impl Connection {
             config,
             global_bandwidth,
             acl_manager,
+            metrics,
         }
     }
 
@@ -667,6 +674,7 @@ impl Connection {
         fields(remote_peer = %self.remote_peer.ip()),
     )]
     async fn process(self) -> Result<(), SocksError> {
+        let start_time = std::time::Instant::now();
         let config = Arc::clone(&self.config);
         let global_bw = self.global_bandwidth.clone();
         let per_conn_bps = config.bandwidth_per_connection;
@@ -674,8 +682,9 @@ impl Connection {
             .socket
             .local_addr()
             .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+        let metrics = Arc::clone(&self.metrics);
 
-        tokio::time::timeout(config.connection_timeout, async {
+        let timeout_result = tokio::time::timeout(config.connection_timeout, async {
             tracing::debug!("Session start");
 
             let (mut read_half, mut write_half) = self.socket.into_split();
@@ -694,11 +703,12 @@ impl Connection {
 
             if selected_method == AuthMethod::NO_ACCEPTABLE {
                 tracing::info!("No acceptable auth methods, closing connection");
-                return Ok(());
+                return Ok::<(), SocksError>(());
             }
 
             // --- Username/Password subnegotiation (RFC 1929) ---
             if selected_method == AuthMethod::USERNAME_PASSWORD {
+                metrics.record_auth_attempt();
                 let auth_req = timeout(
                     config.client_read_timeout,
                     AuthRequest::read_from(&mut read_half),
@@ -713,9 +723,11 @@ impl Connection {
 
                 if config.authenticate(&auth_req.username, &auth_req.password) {
                     tracing::debug!(user = %auth_req.username, "Authentication succeeded");
+                    metrics.record_auth_success();
                     AuthResponse::success().write_to(&mut write_half).await?;
                 } else {
                     tracing::info!(user = %auth_req.username, "Authentication failed");
+                    metrics.record_auth_failure();
                     AuthResponse::failure().write_to(&mut write_half).await?;
                     return Ok(());
                 }
@@ -728,9 +740,17 @@ impl Connection {
                 address = ?request.address,
                 "Received SOCKS request"
             );
+            
+            // Record request metrics
+            let command_name = match request.command {
+                SocksCommand::Connect => "CONNECT",
+                SocksCommand::Bind => "BIND",
+                SocksCommand::UdpAssociate => "UDP_ASSOCIATE",
+            };
+            metrics.record_request(command_name);
 
             // --- Process request ---
-            let outcome = Self::process_request(&request, &config, local_addr, &self.acl_manager).await;
+            let outcome = Self::process_request(&request, &config, local_addr, &self.acl_manager, &metrics).await;
 
             match outcome {
                 // ---- CONNECT ----
@@ -747,7 +767,7 @@ impl Connection {
                     let mut throttled_remote = ThrottledStream::new(
                         remote_stream, per_conn_bps, global_bw.clone(),
                     );
-                    Self::relay_data(&mut throttled_client, &mut throttled_remote).await;
+                    Self::relay_data(&mut throttled_client, &mut throttled_remote, &metrics).await;
                 }
 
                 // ---- BIND ----
@@ -788,7 +808,7 @@ impl Connection {
                             let mut throttled_remote = ThrottledStream::new(
                                 remote_stream, per_conn_bps, global_bw.clone(),
                             );
-                            Self::relay_data(&mut throttled_client, &mut throttled_remote).await;
+                            Self::relay_data(&mut throttled_client, &mut throttled_remote, &metrics).await;
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("BIND accept error: {}", e);
@@ -839,16 +859,32 @@ impl Connection {
                         SocksResponse::new(reply_code, Self::get_unspec_address());
                     tracing::debug!(reply = response.reply as u8, "Sending error response");
                     Self::send_response(&mut write_half, &response).await?;
+                    metrics.record_error(&format!("request_{}", reply_code as u8));
                 }
             }
 
+            // Record session duration
+            let duration = start_time.elapsed();
+            metrics.record_request_duration(command_name, duration.as_secs_f64());
+            
             tracing::debug!("Session end");
             Ok(())
         })
-        .await
-        .map_err(|_| {
-            SocksError::IoError(std::io::ErrorKind::TimedOut, "Connection timeout".into())
-        })?
+        .await;
+
+        // Handle timeout
+        if let Err(_) = timeout_result {
+            metrics.record_error("connection_timeout");
+            return Err(SocksError::IoError(
+                std::io::ErrorKind::TimedOut,
+                "Connection timeout".into(),
+            ));
+        }
+
+        // Record connection close
+        metrics.record_connection_close();
+
+        Ok(())
     }
 
     // ========================================================================
@@ -951,9 +987,10 @@ impl Connection {
         config: &ServerConfig,
         local_addr: SocketAddr,
         acl_manager: &AclManager,
+        metrics: &MetricsManager,
     ) -> Result<RequestOutcome, SocksError> {
         match request.command {
-            SocksCommand::Connect => Self::handle_connect(request, config, acl_manager).await,
+            SocksCommand::Connect => Self::handle_connect(request, config, acl_manager, metrics).await,
             SocksCommand::Bind => Self::handle_bind(config, local_addr).await,
             SocksCommand::UdpAssociate => Self::handle_udp_associate(config, local_addr).await,
         }
@@ -965,6 +1002,7 @@ impl Connection {
         request: &SocksRequest,
         config: &ServerConfig,
         acl_manager: &AclManager,
+        metrics: &MetricsManager,
     ) -> Result<RequestOutcome, SocksError> {
         // ACL check: domain
         if let SocksAddress::Domain(ref domain, _) = request.address {
@@ -975,11 +1013,13 @@ impl Connection {
                 Ok(decision) => {
                     if !decision.is_allowed() {
                         tracing::info!(domain = %domain, reason = ?decision, "Domain denied by ACL");
+                        metrics.record_acl_decision(AclDecisionLabel::Deny, "domain");
                         return Ok(RequestOutcome::Error(SocksResponse::new(
                             ReplyCode::ConnectionNotAllowed,
                             Self::get_unspec_address(),
                         )));
                     }
+                    metrics.record_acl_decision(AclDecisionLabel::Allow, "domain");
                 }
                 Err(_) => {
                     tracing::warn!(domain = %domain, "ACL domain check timeout");
@@ -999,11 +1039,13 @@ impl Connection {
             Ok(decision) => {
                 if !decision.is_allowed() {
                     tracing::info!(port = request.address.port(), reason = ?decision, "Port denied by ACL");
+                    metrics.record_acl_decision(AclDecisionLabel::Deny, "port");
                     return Ok(RequestOutcome::Error(SocksResponse::new(
                         ReplyCode::ConnectionNotAllowed,
                         Self::get_unspec_address(),
                     )));
                 }
+                metrics.record_acl_decision(AclDecisionLabel::Allow, "port");
             }
             Err(_) => {
                 tracing::warn!(port = request.address.port(), "ACL port check timeout");
@@ -1128,7 +1170,11 @@ impl Connection {
     // ========================================================================
 
     /// Relay data bidirectionally between client and remote (TCP).
-    async fn relay_data<C, R>(client: &mut C, remote: &mut R)
+    async fn relay_data<C, R>(
+        client: &mut C,
+        remote: &mut R,
+        metrics: &MetricsManager,
+    )
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1141,9 +1187,13 @@ impl Connection {
                     bytes_remote_to_client = r2c,
                     "Relay completed"
                 );
+                // Record bytes transferred
+                metrics.record_bytes(c2r, "tx");
+                metrics.record_bytes(r2c, "rx");
             }
             Err(err) => {
                 tracing::debug!("Relay error: {}", err);
+                metrics.record_error("relay_error");
             }
         }
     }
@@ -1279,7 +1329,8 @@ impl Connection {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr: std::net::SocketAddr = "127.0.0.1:1080".parse().unwrap();
     let acl_manager = AclManager::new(&acl::AclConfig::default())?;
-    run_with_config(addr, ServerConfig::default(), acl_manager).await
+    let metrics_manager = MetricsManager::new();
+    run_with_config(addr, ServerConfig::default(), acl_manager, metrics_manager).await
 }
 
 #[tracing::instrument(name = "server", skip())]
@@ -1289,20 +1340,23 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         port,
     );
     let acl_manager = AclManager::new(&acl::AclConfig::default())?;
-    run_with_config(addr, ServerConfig::default(), acl_manager).await
+    let metrics_manager = MetricsManager::new();
+    run_with_config(addr, ServerConfig::default(), acl_manager, metrics_manager).await
 }
 
-#[tracing::instrument(name = "server", skip(config, acl_manager))]
+#[tracing::instrument(name = "server", skip(config, acl_manager, metrics_manager))]
 pub async fn run_with_config(
     listen_addr: std::net::SocketAddr,
     config: ServerConfig,
     acl_manager: AclManager,
+    metrics_manager: MetricsManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("SOCKS5 server listening on {}", listen_addr);
 
     let config = Arc::new(config);
     let acl_manager = Arc::new(acl_manager);
+    let metrics_manager = Arc::new(metrics_manager);
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
 
     // Get max_connections_per_ip from ACL if configured, otherwise use server config
@@ -1327,12 +1381,24 @@ pub async fn run_with_config(
     let shutdown_timeout = config.shutdown_timeout;
     let mut shutdown = std::pin::pin!(wait_for_shutdown_signal());
 
+    // Start metrics server in a separate task
+    let metrics_server_config = MetricsServerConfig::default();
+    let metrics_clone = Arc::clone(&metrics_manager);
+    tokio::spawn(async move {
+        if let Err(e) = run_metrics_server(metrics_server_config, metrics_clone).await {
+            tracing::error!("Metrics server error: {}", e);
+        }
+    });
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((socket, remote_peer)) => {
                         let client_ip = remote_peer.ip();
+
+                        // Record new connection attempt
+                        metrics_manager.record_connection(&client_ip.to_string());
 
                         // ACL check - client IP
                         let acl_check = {
@@ -1353,13 +1419,19 @@ pub async fn run_with_config(
                         
                         if !acl_check.is_allowed() {
                             tracing::info!(ip = %client_ip, reason = ?acl_check, "Connection denied by ACL");
+                            metrics_manager.record_acl_decision(AclDecisionLabel::Deny, "ip");
+                            metrics_manager.record_connection_reject(&client_ip.to_string());
                             drop(socket);
                             continue;
                         }
+                        
+                        // Record ACL allow
+                        metrics_manager.record_acl_decision(AclDecisionLabel::Allow, "ip");
 
                         // Global connection rate limit
                         if !tracker.check_accept_rate() {
                             tracing::debug!(ip = %client_ip, "Connection rate limited");
+                            metrics_manager.record_connection_reject(&client_ip.to_string());
                             drop(socket);
                             continue;
                         }
@@ -1367,6 +1439,7 @@ pub async fn run_with_config(
                         // Per-IP request rate limit
                         if !tracker.check_ip_rate(client_ip) {
                             tracing::debug!(ip = %client_ip, "Per-IP rate limited");
+                            metrics_manager.record_connection_reject(&client_ip.to_string());
                             drop(socket);
                             continue;
                         }
@@ -1375,6 +1448,7 @@ pub async fn run_with_config(
                             Some(p) => p,
                             None => {
                                 tracing::warn!(ip = %client_ip, "Connection limit exceeded");
+                                metrics_manager.record_connection_reject(&client_ip.to_string());
                                 drop(socket);
                                 continue;
                             }
@@ -1390,6 +1464,7 @@ pub async fn run_with_config(
                         let conn_config = Arc::clone(&config);
                         let conn_bw = global_bandwidth.clone();
                         let conn_acl = Arc::clone(&acl_manager);
+                        let conn_metrics = Arc::clone(&metrics_manager);
 
                         join_set.spawn(async move {
                             let _guard = ConnectionGuard {
@@ -1397,7 +1472,7 @@ pub async fn run_with_config(
                                 ip: client_ip,
                                 _permit: permit,
                             };
-                            Connection::new(socket, remote_peer, conn_config, conn_bw, conn_acl)
+                            Connection::new(socket, remote_peer, conn_config, conn_bw, conn_acl, conn_metrics)
                                 .process()
                                 .await
                         });

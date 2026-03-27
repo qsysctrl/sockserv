@@ -102,7 +102,8 @@ async fn start_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             port,
         );
         let acl_manager = server::acl::AclManager::new(&server::acl::AclConfig::default()).unwrap();
-        let _ = server::run_with_config(addr, config, acl_manager).await;
+        let metrics_manager = server::metrics::MetricsManager::new();
+        let _ = server::run_with_config(addr, config, acl_manager, metrics_manager).await;
     });
 
     (handle, ready)
@@ -740,7 +741,8 @@ async fn start_auth_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             port,
         );
         let acl_manager = server::acl::AclManager::new(&server::acl::AclConfig::default()).unwrap();
-        let _ = server::run_with_config(addr, config, acl_manager).await;
+        let metrics_manager = server::metrics::MetricsManager::new();
+        let _ = server::run_with_config(addr, config, acl_manager, metrics_manager).await;
     });
 
     (handle, ready)
