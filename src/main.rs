@@ -1,4 +1,5 @@
 use sockserv::config::FileConfig;
+use sockserv::server::acl::AclManager;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -18,9 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("No config file specified, using defaults");
     }
 
-    let (listen_addr, server_config) = file_config.into_server_config();
+    let (listen_addr, server_config, acl_config) = file_config.into_server_config();
 
-    sockserv::server::run_with_config(listen_addr, server_config).await?;
+    // Create ACL manager
+    let acl_manager = AclManager::new(&acl_config)?;
+
+    sockserv::server::run_with_config(listen_addr, server_config, acl_manager).await?;
 
     Ok(())
 }

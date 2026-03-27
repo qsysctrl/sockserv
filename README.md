@@ -27,6 +27,11 @@ A high-performance SOCKS5 proxy server implementation in Rust, built with Tokio.
 - Connection timeout (10s default)
 - Bidirectional data relay
 - Rate limiting (per-IP, connection, bandwidth)
+- **Access Control Lists (ACL)**:
+  - IP whitelist/blacklist with CIDR notation
+  - Domain filtering with wildcard support
+  - Port restrictions with range support
+  - Per-IP connection limit overrides
 
 ## Roadmap
 
@@ -37,10 +42,10 @@ A high-performance SOCKS5 proxy server implementation in Rust, built with Tokio.
 - Username/Password authentication (RFC 1929)
 - Rate limiting (Token Bucket algorithm)
 - Configuration file support (TOML)
+- **Access Control Lists (ACL)**
 
 ### In Progress
 
-- Access control lists (ACL)
 - Metrics/Monitoring (Prometheus)
 
 ### Future
@@ -398,6 +403,44 @@ The protocol module (`src/server/protocol.rs`) implements:
 - Reply codes: `REP_SUCCESS`, `REP_GENERAL_FAILURE`, etc.
 
 ## Configuration
+
+Configuration is done via a TOML file. Pass the config file path as an argument:
+
+```bash
+cargo run -- config.toml
+```
+
+See [config.example.toml](config.example.toml) for a complete example with all options.
+
+### Access Control Lists (ACL)
+
+The ACL system provides fine-grained control over which clients and destinations are allowed:
+
+```toml
+[acl]
+# IP-based access control (CIDR notation supported)
+# Whitelist mode: only allow these networks
+ip_whitelist = ["10.0.0.0/8", "192.168.1.0/24"]
+# OR blacklist mode: deny these networks
+# ip_blacklist = ["192.168.100.0/24"]
+
+# Domain-based access control (wildcards supported)
+# Whitelist mode: only allow these domains
+# domain_whitelist = ["*.trusted.com", "example.com"]
+# Blacklist mode: deny these domains
+domain_blacklist = ["*.evil.com", "badsite.com"]
+
+# Port-based access control (ranges supported)
+# Whitelist mode: only allow these ports
+port_whitelist = ["80", "443", "8000-9000"]
+# OR blacklist mode: deny these ports
+# port_blacklist = ["22", "23", "25"]
+
+# Override max connections per IP (optional)
+max_connections_per_ip = 50
+```
+
+**Important**: Whitelist and blacklist are mutually exclusive for each category. If both are empty, all traffic is allowed (subject to other security settings).
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|

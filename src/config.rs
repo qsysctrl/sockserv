@@ -3,6 +3,7 @@
 //! Loads a TOML config and converts it into a [`ServerConfig`](crate::server::ServerConfig)
 //! plus the listen address and logging parameters that live outside `ServerConfig`.
 
+use crate::server::acl::AclConfig;
 use crate::server::ServerConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -30,6 +31,8 @@ pub struct FileConfig {
     pub rate_limit: RateLimitSection,
     #[serde(default)]
     pub security: SecuritySection,
+    #[serde(default)]
+    pub acl: AclSection,
     #[serde(default)]
     pub logging: LoggingSection,
 }
@@ -191,6 +194,71 @@ impl Default for SecuritySection {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AclSection {
+    /// IP addresses or CIDRs to always allow (mutually exclusive with blacklist).
+    #[serde(default)]
+    pub ip_whitelist: Vec<String>,
+    /// IP addresses or CIDRs to always deny (mutually exclusive with whitelist).
+    #[serde(default)]
+    pub ip_blacklist: Vec<String>,
+    /// Domain patterns to allow (mutually exclusive with blacklist).
+    /// Supports wildcards: *.example.com matches any subdomain.
+    #[serde(default)]
+    pub domain_whitelist: Vec<String>,
+    /// Domain patterns to deny (mutually exclusive with whitelist).
+    #[serde(default)]
+    pub domain_blacklist: Vec<String>,
+    /// Port ranges to allow (mutually exclusive with blacklist).
+    /// Format: "80" or "80-443".
+    #[serde(default)]
+    pub port_whitelist: Vec<String>,
+    /// Port ranges to deny (mutually exclusive with whitelist).
+    #[serde(default)]
+    pub port_blacklist: Vec<String>,
+    /// Override max connections per IP (optional).
+    #[serde(default)]
+    pub max_connections_per_ip: Option<usize>,
+}
+
+impl AclSection {
+    /// Validate the ACL section for conflicting lists.
+    fn validate(&self) -> Result<(), ConfigError> {
+        use crate::server::acl::AclConfig;
+
+        // Convert to AclConfig to validate - this will catch conflicting lists
+        let config = AclConfig {
+            ip_whitelist: self.ip_whitelist.clone(),
+            ip_blacklist: self.ip_blacklist.clone(),
+            domain_whitelist: self.domain_whitelist.clone(),
+            domain_blacklist: self.domain_blacklist.clone(),
+            port_whitelist: self.port_whitelist.clone(),
+            port_blacklist: self.port_blacklist.clone(),
+            max_connections_per_ip: self.max_connections_per_ip,
+        };
+
+        // Try to create an engine - this validates all patterns
+        crate::server::acl::AclEngine::new(&config)
+            .map_err(|e| ConfigError::Validation(format!("ACL configuration error: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Convert to ACL configuration.
+    pub fn into_acl_config(self) -> AclConfig {
+        AclConfig {
+            ip_whitelist: self.ip_whitelist,
+            ip_blacklist: self.ip_blacklist,
+            domain_whitelist: self.domain_whitelist,
+            domain_blacklist: self.domain_blacklist,
+            port_whitelist: self.port_whitelist,
+            port_blacklist: self.port_blacklist,
+            max_connections_per_ip: self.max_connections_per_ip,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingSection {
@@ -317,11 +385,14 @@ impl FileConfig {
             ));
         }
 
+        // Validate ACL configuration
+        self.acl.validate()?;
+
         Ok(())
     }
 
-    /// Convert into the runtime `ServerConfig` plus the listen address.
-    pub fn into_server_config(self) -> (std::net::SocketAddr, ServerConfig) {
+    /// Convert into the runtime `ServerConfig` plus the listen address and ACL config.
+    pub fn into_server_config(self) -> (std::net::SocketAddr, ServerConfig, AclConfig) {
         let listen_addr =
             std::net::SocketAddr::new(self.server.listen_address, self.server.listen_port);
 
@@ -329,6 +400,8 @@ impl FileConfig {
             "password" => Some(self.auth.users),
             _ => None,
         };
+
+        let acl_config = self.acl.into_acl_config();
 
         let config = ServerConfig {
             max_auth_methods: self.limits.max_auth_methods,
@@ -350,7 +423,7 @@ impl FileConfig {
             bandwidth_total: self.rate_limit.bandwidth_total,
         };
 
-        (listen_addr, config)
+        (listen_addr, config, acl_config)
     }
 }
 
@@ -464,7 +537,7 @@ format = "json"
         assert!(cfg.security.allow_private_destinations);
         assert_eq!(cfg.logging.format, "json");
 
-        let (addr, server_cfg) = cfg.into_server_config();
+        let (addr, server_cfg, acl_config) = cfg.into_server_config();
         assert_eq!(addr.port(), 9090);
         assert!(server_cfg.credentials.is_some());
         assert_eq!(
@@ -477,6 +550,9 @@ format = "json"
         assert_eq!(server_cfg.per_ip_rps, 50);
         assert_eq!(server_cfg.bandwidth_per_connection, 1_048_576);
         assert_eq!(server_cfg.bandwidth_total, 104_857_600);
+        // ACL config should be empty by default
+        assert!(acl_config.ip_whitelist.is_empty());
+        assert!(acl_config.ip_blacklist.is_empty());
     }
 
     #[test]
@@ -548,9 +624,10 @@ listen_port = 0
     #[test]
     fn test_into_server_config_no_auth() {
         let cfg = FileConfig::from_str("").unwrap();
-        let (addr, server_cfg) = cfg.into_server_config();
+        let (addr, server_cfg, acl_config) = cfg.into_server_config();
         assert_eq!(addr, "127.0.0.1:1080".parse().unwrap());
         assert!(server_cfg.credentials.is_none());
+        assert!(acl_config.ip_whitelist.is_empty());
     }
 
     #[test]

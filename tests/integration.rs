@@ -101,7 +101,8 @@ async fn start_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             port,
         );
-        let _ = server::run_with_config(addr, config).await;
+        let acl_manager = server::acl::AclManager::new(&server::acl::AclConfig::default()).unwrap();
+        let _ = server::run_with_config(addr, config, acl_manager).await;
     });
 
     (handle, ready)
@@ -738,7 +739,8 @@ async fn start_auth_test_server(port: u16) -> (JoinHandle<()>, Arc<Notify>) {
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             port,
         );
-        let _ = server::run_with_config(addr, config).await;
+        let acl_manager = server::acl::AclManager::new(&server::acl::AclConfig::default()).unwrap();
+        let _ = server::run_with_config(addr, config, acl_manager).await;
     });
 
     (handle, ready)

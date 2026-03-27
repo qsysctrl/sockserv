@@ -1,5 +1,7 @@
+pub mod acl;
 pub mod protocol;
 
+use acl::AclManager;
 use protocol::{
     AuthMethod, AuthRequest, AuthResponse, ClientHello, ReplyCode, ServerHello, SocksAddress,
     SocksCommand, SocksError, SocksRequest, SocksResponse, UdpRelayHeader, SOCKS_VERSION,
@@ -638,6 +640,7 @@ struct Connection {
     remote_peer: SocketAddr,
     config: Arc<ServerConfig>,
     global_bandwidth: Option<Arc<BandwidthLimiter>>,
+    acl_manager: Arc<AclManager>,
 }
 
 impl Connection {
@@ -646,12 +649,14 @@ impl Connection {
         remote_peer: SocketAddr,
         config: Arc<ServerConfig>,
         global_bandwidth: Option<Arc<BandwidthLimiter>>,
+        acl_manager: Arc<AclManager>,
     ) -> Self {
         Self {
             socket,
             remote_peer,
             config,
             global_bandwidth,
+            acl_manager,
         }
     }
 
@@ -725,7 +730,7 @@ impl Connection {
             );
 
             // --- Process request ---
-            let outcome = Self::process_request(&request, &config, local_addr).await;
+            let outcome = Self::process_request(&request, &config, local_addr, &self.acl_manager).await;
 
             match outcome {
                 // ---- CONNECT ----
@@ -945,9 +950,10 @@ impl Connection {
         request: &SocksRequest,
         config: &ServerConfig,
         local_addr: SocketAddr,
+        acl_manager: &AclManager,
     ) -> Result<RequestOutcome, SocksError> {
         match request.command {
-            SocksCommand::Connect => Self::handle_connect(request, config).await,
+            SocksCommand::Connect => Self::handle_connect(request, config, acl_manager).await,
             SocksCommand::Bind => Self::handle_bind(config, local_addr).await,
             SocksCommand::UdpAssociate => Self::handle_udp_associate(config, local_addr).await,
         }
@@ -958,7 +964,56 @@ impl Connection {
     async fn handle_connect(
         request: &SocksRequest,
         config: &ServerConfig,
+        acl_manager: &AclManager,
     ) -> Result<RequestOutcome, SocksError> {
+        // ACL check: domain
+        if let SocksAddress::Domain(ref domain, _) = request.address {
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                acl_manager.check_domain(domain)
+            ).await {
+                Ok(decision) => {
+                    if !decision.is_allowed() {
+                        tracing::info!(domain = %domain, reason = ?decision, "Domain denied by ACL");
+                        return Ok(RequestOutcome::Error(SocksResponse::new(
+                            ReplyCode::ConnectionNotAllowed,
+                            Self::get_unspec_address(),
+                        )));
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(domain = %domain, "ACL domain check timeout");
+                    return Ok(RequestOutcome::Error(SocksResponse::new(
+                        ReplyCode::TtlExpired,
+                        Self::get_unspec_address(),
+                    )));
+                }
+            }
+        }
+
+        // ACL check: port
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            acl_manager.check_port(request.address.port())
+        ).await {
+            Ok(decision) => {
+                if !decision.is_allowed() {
+                    tracing::info!(port = request.address.port(), reason = ?decision, "Port denied by ACL");
+                    return Ok(RequestOutcome::Error(SocksResponse::new(
+                        ReplyCode::ConnectionNotAllowed,
+                        Self::get_unspec_address(),
+                    )));
+                }
+            }
+            Err(_) => {
+                tracing::warn!(port = request.address.port(), "ACL port check timeout");
+                return Ok(RequestOutcome::Error(SocksResponse::new(
+                    ReplyCode::TtlExpired,
+                    Self::get_unspec_address(),
+                )));
+            }
+        }
+
         let target_addr = resolve_address(&request.address, config).await?;
         tracing::debug!(target = %target_addr, "Connecting to target server");
 
@@ -1024,7 +1079,7 @@ impl Connection {
     // ---- UDP ASSOCIATE ----
 
     async fn handle_udp_associate(
-        config: &ServerConfig,
+        _config: &ServerConfig,
         local_addr: SocketAddr,
     ) -> Result<RequestOutcome, SocksError> {
         let bind_ip = local_addr.ip();
@@ -1223,7 +1278,8 @@ impl Connection {
 #[tracing::instrument(name = "server")]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr: std::net::SocketAddr = "127.0.0.1:1080".parse().unwrap();
-    run_with_config(addr, ServerConfig::default()).await
+    let acl_manager = AclManager::new(&acl::AclConfig::default())?;
+    run_with_config(addr, ServerConfig::default(), acl_manager).await
 }
 
 #[tracing::instrument(name = "server", skip())]
@@ -1232,22 +1288,29 @@ pub async fn run_on_port(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port,
     );
-    run_with_config(addr, ServerConfig::default()).await
+    let acl_manager = AclManager::new(&acl::AclConfig::default())?;
+    run_with_config(addr, ServerConfig::default(), acl_manager).await
 }
 
-#[tracing::instrument(name = "server", skip(config))]
+#[tracing::instrument(name = "server", skip(config, acl_manager))]
 pub async fn run_with_config(
     listen_addr: std::net::SocketAddr,
     config: ServerConfig,
+    acl_manager: AclManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("SOCKS5 server listening on {}", listen_addr);
 
     let config = Arc::new(config);
+    let acl_manager = Arc::new(acl_manager);
     let mut join_set = tokio::task::JoinSet::<Result<(), SocksError>>::new();
 
+    // Get max_connections_per_ip from ACL if configured, otherwise use server config
+    let max_connections_per_ip = acl_manager.max_connections_per_ip().await
+        .unwrap_or(config.max_connections_per_ip);
+
     let tracker = Arc::new(ConnectionTracker::new(
-        config.max_connections_per_ip,
+        max_connections_per_ip,
         config.max_concurrent_connections,
         config.per_ip_rps,
         config.connection_rate_limit,
@@ -1270,6 +1333,29 @@ pub async fn run_with_config(
                 match result {
                     Ok((socket, remote_peer)) => {
                         let client_ip = remote_peer.ip();
+
+                        // ACL check - client IP
+                        let acl_check = {
+                            let acl = Arc::clone(&acl_manager);
+                            // Fast path: use blocking read for simple IP check
+                            // In production, consider async with timeout
+                            match tokio::time::timeout(
+                                Duration::from_millis(100),
+                                acl.check_client_ip(&client_ip)
+                            ).await {
+                                Ok(decision) => decision,
+                                Err(_) => {
+                                    tracing::warn!(ip = %client_ip, "ACL check timeout");
+                                    acl::AclDecision::Deny("ACL check timeout")
+                                }
+                            }
+                        };
+                        
+                        if !acl_check.is_allowed() {
+                            tracing::info!(ip = %client_ip, reason = ?acl_check, "Connection denied by ACL");
+                            drop(socket);
+                            continue;
+                        }
 
                         // Global connection rate limit
                         if !tracker.check_accept_rate() {
@@ -1303,6 +1389,7 @@ pub async fn run_with_config(
                         let conn_tracker = Arc::clone(&tracker);
                         let conn_config = Arc::clone(&config);
                         let conn_bw = global_bandwidth.clone();
+                        let conn_acl = Arc::clone(&acl_manager);
 
                         join_set.spawn(async move {
                             let _guard = ConnectionGuard {
@@ -1310,7 +1397,7 @@ pub async fn run_with_config(
                                 ip: client_ip,
                                 _permit: permit,
                             };
-                            Connection::new(socket, remote_peer, conn_config, conn_bw)
+                            Connection::new(socket, remote_peer, conn_config, conn_bw, conn_acl)
                                 .process()
                                 .await
                         });

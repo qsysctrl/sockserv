@@ -460,6 +460,15 @@ impl SocksAddress {
             Self::Ipv6(_, _) => ATYP_IPV6,
         }
     }
+
+    /// Get the port number
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Ipv4(_, port) => *port,
+            Self::Domain(_, port) => *port,
+            Self::Ipv6(_, port) => *port,
+        }
+    }
 }
 
 // ============================================================================
